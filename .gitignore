@@ -17,3 +17,6 @@ venv/
 
 .idea/
 .vscode/
+
+# Los comandos/skills de OpenSpec viven en ~/.claude (config global del usuario)
+.claude/
