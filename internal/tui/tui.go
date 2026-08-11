@@ -63,7 +63,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "q", "ctrl+c", "esc":
+	case "ctrl+c":
+		// Unconditional, and deliberately not grouped with the keys below.
+		// Ctrl-C means "stop this program" everywhere else in a terminal; a
+		// pane that swallows it leaves the user pressing it harder at something
+		// that has decided it means "close a pane".
+		return m, tea.Quit
+	case "q", "esc":
 		if m.detail || m.showHelp {
 			m.detail, m.showHelp = false, false
 			return m, nil
@@ -205,8 +211,11 @@ func (m Model) View() string {
 		width = 80
 	}
 
+	header := m.renderHeader(width)
+	footer := styleDim.Render("\n  ?  help   q  quit\n")
+
 	var b strings.Builder
-	b.WriteString(m.renderHeader(width))
+	b.WriteString(header)
 
 	switch {
 	case m.showHelp:
@@ -216,12 +225,20 @@ func (m Model) View() string {
 	case m.detail:
 		b.WriteString(m.renderDetail())
 	default:
-		b.WriteString(m.renderTable(width))
+		// Whatever the header and footer did not take, less the one line the
+		// column titles occupy. A non-positive result means the terminal is too
+		// short to be reasoned about, and renderTable falls back to drawing
+		// everything rather than nothing.
+		b.WriteString(m.renderTable(width, m.height-lineCount(header)-lineCount(footer)-1))
 	}
 
-	b.WriteString(styleDim.Render("\n  ?  help   q  quit\n"))
+	b.WriteString(footer)
 	return b.String()
 }
+
+// lineCount reports how many terminal lines s occupies. Every fragment here
+// ends in a newline, so counting newlines counts lines.
+func lineCount(s string) int { return strings.Count(s, "\n") }
 
 func (m Model) renderHeader(width int) string {
 	var b strings.Builder
@@ -252,8 +269,26 @@ func (m Model) renderEmpty() string {
 			"  Open one and it will appear here on the next refresh.\n")
 }
 
-func (m Model) renderTable(width int) string {
+// renderTable draws at most maxRows lines of sessions, scrolled so the cursor
+// is always among them. A maxRows of zero or less means no limit.
+//
+// Without this the table draws every row it has and lets the terminal scroll
+// the top of the screen away — taking the fleet total, the staleness warning
+// and, when the cursor is far enough down, the selection indicator with it. A
+// dashboard whose whole purpose is surfacing the session waiting on you cannot
+// be one that hides which session is selected.
+func (m Model) renderTable(width, maxRows int) string {
 	visible := visibleColumns(width)
+	rows := m.snapshot.Rows
+
+	start, end := 0, len(rows)
+	if maxRows > 0 && len(rows) > maxRows {
+		// One line goes to the position indicator, so it is never a surprise
+		// that the list continues past the edge of the screen.
+		window := maxInt(1, maxRows-1)
+		start = minInt(maxInt(0, m.cursor-window/2), len(rows)-window)
+		end = start + window
+	}
 
 	var b strings.Builder
 	b.WriteString("  ")
@@ -262,7 +297,8 @@ func (m Model) renderTable(width int) string {
 	}
 	b.WriteString("\n")
 
-	for i, row := range m.snapshot.Rows {
+	for i := start; i < end; i++ {
+		row := rows[i]
 		cursor := "  "
 		if i == m.cursor {
 			cursor = styleCursor.Render("▸ ")
@@ -278,6 +314,10 @@ func (m Model) renderTable(width int) string {
 			b.WriteString(padded + " ")
 		}
 		b.WriteString("\n")
+	}
+
+	if end-start < len(rows) {
+		b.WriteString(styleDim.Render(fmt.Sprintf("  ↕ %d–%d of %d\n", start+1, end, len(rows))))
 	}
 	return b.String()
 }
@@ -302,6 +342,12 @@ func (m Model) cell(row Row, title string) string {
 		cost := row.Cost.String()
 		if row.Partial {
 			cost += "*"
+		}
+		if row.Degraded {
+			// Distinct from the partial marker on purpose. A starred figure was
+			// counted but could not be priced; a flagged one was never counted
+			// at all, and is therefore too low rather than incomplete.
+			cost += "!"
 		}
 		return cost
 	}
@@ -347,6 +393,12 @@ func (m Model) renderDetail() string {
 	if s.Ended() {
 		lines = append(lines, [2]string{"Ended", formatTime(*s.EndedAt)})
 	}
+	if row.Partial {
+		lines = append(lines, [2]string{"Note", "some usage could not be priced; tokens counted, cost incomplete"})
+	}
+	if row.Degraded {
+		lines = append(lines, [2]string{"Note", "some records could not be read; this figure understates the true cost"})
+	}
 
 	var b strings.Builder
 	for _, l := range lines {
@@ -363,10 +415,19 @@ func renderHelp() string {
 		{"g / G", "first / last"},
 		{"enter", "session detail"},
 		{"?", "toggle this help"},
-		{"q / esc", "quit"},
+		{"q / esc", "close, or quit"},
+		{"ctrl-c", "quit"},
 	}
 	var b strings.Builder
 	for _, r := range rows {
+		b.WriteString("  " + styleHeader.Render(pad(r[0], 10)) + " " + styleDim.Render(r[1]) + "\n")
+	}
+
+	b.WriteString("\n")
+	for _, r := range [][2]string{
+		{"$0.00*", "counted, but some of it could not be priced"},
+		{"$0.00!", "some records could not be read; the figure is too low"},
+	} {
 		b.WriteString("  " + styleHeader.Render(pad(r[0], 10)) + " " + styleDim.Render(r[1]) + "\n")
 	}
 	return b.String()
@@ -388,6 +449,13 @@ func formatTime(t time.Time) string {
 
 func maxInt(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
 		return a
 	}
 	return b

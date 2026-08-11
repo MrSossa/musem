@@ -8,8 +8,10 @@
 package archtest
 
 import (
+	"bytes"
 	"go/build"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -174,6 +176,23 @@ func contains(haystack []string, needle string) bool {
 	return false
 }
 
+// clients are the packages that speak a protocol over a socket. Nothing musem
+// builds may reach them by any path, however many dependencies deep.
+var clients = []string{
+	"net/http", "net/http/httputil", "net/smtp", "net/rpc",
+	"crypto/tls", "net/mail",
+}
+
+// dialers open connections. Nothing musem writes may import one directly.
+//
+// They are held to a weaker rule than the clients above because they arrive
+// transitively whether musem wants them or not: the pure-Go SQLite driver pulls
+// in net/url, and google/uuid imports net to read a MAC address. Neither is
+// reachable from anything musem calls, but a test cannot assert that from the
+// import graph alone — so the graph rule stops at the protocol clients and the
+// first-party rule covers everything else.
+var dialers = []string{"net", "net/url", "net/netip", "database/sql/driver"}
+
 // TestNoNetworkEgress asserts musem never reaches the network.
 //
 // The spec promises transcripts are processed locally, and transcripts contain
@@ -181,29 +200,59 @@ func contains(haystack []string, needle string) bool {
 // a future dependency being added in good faith; this does. If a package here
 // ever legitimately needs the network, that is a decision to make deliberately
 // by editing this test, not one to make by accident.
+//
+// The check is transitive because that is the only version worth having. A rule
+// that inspects direct imports is satisfied by any dependency that does the
+// reaching on musem's behalf, which is precisely how this gets in by accident.
 func TestNoNetworkEgress(t *testing.T) {
-	networking := []string{
-		"net", "net/http", "net/url", "net/smtp", "net/rpc",
-		"crypto/tls", "database/sql/driver",
-	}
-
-	dirs := []string{filepath.Join("..", "..")}
-	for _, name := range append(append([]string{}, adapters...), orchestration...) {
-		dirs = append(dirs, filepath.Join("..", name))
-	}
-	dirs = append(dirs, filepath.Join("..", "tui"), filepath.Join("..", "app"))
-
-	for _, dir := range dirs {
-		pkg, ok := importDir(t, dir)
-		if !ok {
-			continue
+	for _, pkg := range listPackages(t, "-deps", "./...") {
+		for _, banned := range clients {
+			if pkg == banned {
+				t.Errorf("%q is in the dependency graph; musem processes transcripts locally and must originate no network traffic", pkg)
+			}
 		}
-		for _, imp := range pkg.Imports {
-			for _, banned := range networking {
-				if imp == banned {
-					t.Errorf("%s imports %q; musem processes transcripts locally and must originate no network traffic", dir, imp)
+	}
+}
+
+// TestFirstPartyCodeImportsNoNetworking is the stricter half, applied to the
+// code this project actually writes — including cmd/musem, which the graph rule
+// above covers only through what it happens to pull in.
+func TestFirstPartyCodeImportsNoNetworking(t *testing.T) {
+	banned := append(append([]string{}, clients...), dialers...)
+
+	for _, pkg := range listPackages(t, "./...") {
+		for _, imp := range listPackages(t, "-f", "{{join .Imports \"\\n\"}}", pkg) {
+			for _, b := range banned {
+				if imp == b {
+					t.Errorf("%s imports %q; musem's own code opens no sockets", pkg, imp)
 				}
 			}
 		}
 	}
+}
+
+// listPackages runs go list and returns its lines. The go tool is the only
+// thing that resolves a module's full dependency graph, and getting that graph
+// right is the entire point of the rule it serves.
+func listPackages(t *testing.T, args ...string) []string {
+	t.Helper()
+
+	cmd := exec.Command("go", append([]string{"list"}, args...)...)
+	cmd.Dir = filepath.Join("..", "..")
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go list %v: %v\n%s", args, err, stderr.String())
+	}
+
+	var pkgs []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			pkgs = append(pkgs, line)
+		}
+	}
+	return pkgs
 }

@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -218,3 +219,77 @@ func writeFile(path, content string) error {
 }
 
 func removeFile(path string) error { return os.Remove(path) }
+
+// The cursor is the whole reason a restart resumes instead of recounting, so it
+// has to survive the same trip the totals do.
+func TestCursorRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "musem.db")
+
+	sc := sample()
+	sc.Cursor = "4096"
+	sc.Skipped = 3
+
+	first := open(t, path)
+	if err := first.Save(ctx, sc); err != nil {
+		t.Fatal(err)
+	}
+	_ = first.Close()
+
+	loaded, err := open(t, path).Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := loaded["s1"]
+	if got.Cursor != "4096" {
+		t.Errorf("Cursor = %q, want %q", got.Cursor, "4096")
+	}
+	if got.Skipped != 3 {
+		t.Errorf("Skipped = %d, want 3", got.Skipped)
+	}
+}
+
+// A database written before the cursor column existed has totals but nothing
+// saying how much of the source produced them. Reading such a row from the
+// start would add its whole history to itself, so it is carried forward at the
+// end of its source instead.
+func TestRowsWrittenBeforeCursorsResumeAtTheEnd(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "musem.db")
+
+	// Build the schema as it stood before the cursor was added, and put a row
+	// in it, exactly as an existing installation would have.
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL)`,
+		`INSERT INTO schema_version (version) VALUES (1)`,
+		migrations[0],
+		`INSERT INTO session_costs (session_id, input_tokens, cost_usd) VALUES ('s1', 500, 2.50)`,
+	} {
+		if _, err := legacy.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := open(t, path).Load(ctx)
+	if err != nil {
+		t.Fatalf("migrating an existing database: %v", err)
+	}
+
+	got, ok := loaded["s1"]
+	if !ok {
+		t.Fatal("the existing row was lost by the migration")
+	}
+	if got.Usage.InputTokens != 500 {
+		t.Errorf("InputTokens = %d, want the preserved 500", got.Usage.InputTokens)
+	}
+	if got.Cursor != "end" {
+		t.Errorf("Cursor = %q, want %q so the row is not counted a second time", got.Cursor, "end")
+	}
+}

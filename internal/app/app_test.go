@@ -2,14 +2,18 @@ package app_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/MrSossa/musem"
 	"github.com/MrSossa/musem/internal/app"
+	"github.com/MrSossa/musem/internal/claude"
 	"github.com/MrSossa/musem/internal/cost"
 	"github.com/MrSossa/musem/internal/inmem"
 	"github.com/MrSossa/musem/internal/registry"
+	"github.com/MrSossa/musem/internal/sqlite"
 	"github.com/MrSossa/musem/internal/tui"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -125,5 +129,135 @@ func TestEndedSessionKeepsItsCost(t *testing.T) {
 	}
 	if amount, known := after.Fleet.Cost.Amount(); !known || amount <= 0 {
 		t.Error("accumulated cost must survive the sessions ending")
+	}
+}
+
+// countingReader records how often each session is read, so a refresh loop that
+// keeps working on sessions that stopped changing shows up as a number.
+type countingReader struct {
+	reads map[string]int
+}
+
+func (c *countingReader) ReadUsage(_ context.Context, sessionID, cursor string) (musem.UsageReading, error) {
+	if c.reads == nil {
+		c.reads = make(map[string]int)
+	}
+	c.reads[sessionID]++
+	if cursor != "" {
+		return musem.UsageReading{Cursor: cursor}, nil
+	}
+	return musem.UsageReading{
+		Entries: []musem.ModelUsage{{Model: "claude-opus-5", Usage: musem.Usage{InputTokens: 10}}},
+		Cursor:  "done",
+	}, nil
+}
+
+// The registry never drops a session, so without a stop the refresh loop grows
+// for as long as musem runs and spends every pass re-reading records that
+// stopped changing hours ago. An ended session is read once more — to catch
+// anything written just before it vanished — and then left alone.
+func TestEndedSessionsAreReadOnceMoreAndThenLeftAlone(t *testing.T) {
+	discoverer := inmem.NewDiscoverer()
+	reader := &countingReader{}
+	accountant := cost.New(cost.NewRateTable(), reader, nil)
+	reg := registry.New(discoverer, inmem.BranchResolver{})
+	ctx := context.Background()
+
+	reg.Refresh(ctx)
+	composer := app.New(reg, accountant)
+	composer.Refresh(ctx)
+
+	var id string
+	for _, row := range composer.Snapshot().Rows {
+		id = row.Session.ID
+		break
+	}
+	if id == "" {
+		t.Fatal("no sessions to begin with")
+	}
+	live := reader.reads[id]
+
+	discoverer.SetSessions(nil)
+	reg.Refresh(ctx)
+
+	composer.Refresh(ctx) // the final pass, which must happen
+	if reader.reads[id] != live+1 {
+		t.Fatalf("reads = %d, want one final pass after the session ended", reader.reads[id])
+	}
+
+	for i := 0; i < 5; i++ {
+		composer.Refresh(ctx)
+	}
+	if reader.reads[id] != live+1 {
+		t.Errorf("reads = %d after five further refreshes, want no further reads", reader.reads[id])
+	}
+}
+
+// The original defect lived in the seam between the real reader and the real
+// store: totals were persisted, the reader's position was not, so the first
+// pass after startup added the whole transcript to the total it had just
+// restored — and did it again on every launch. The fakes above cannot show
+// that; only the two real adapters together can.
+func TestRestartDoesNotRecountWithTheRealAdapters(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	projects := filepath.Join(dir, "projects", "repo")
+	if err := os.MkdirAll(projects, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(projects, "s1.jsonl")
+	line := `{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":1000000,"output_tokens":0}}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(dir, "musem.db")
+
+	// Each launch builds the graph from scratch, exactly as main.go does.
+	launch := func() musem.SessionCost {
+		t.Helper()
+
+		store, err := sqlite.Open(ctx, dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = store.Close() }()
+
+		reader := claude.NewUsageReader()
+		reader.ProjectsDir = filepath.Join(dir, "projects")
+
+		accountant := cost.New(cost.NewRateTable(), reader, store)
+		if err := accountant.Restore(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := accountant.Update(ctx, "s1"); err != nil {
+			t.Fatal(err)
+		}
+
+		sc, ok := accountant.Session("s1")
+		if !ok {
+			t.Fatal("session not accounted for")
+		}
+		return sc
+	}
+
+	first := launch()
+	if first.Usage.InputTokens != 1_000_000 {
+		t.Fatalf("InputTokens = %d on the first launch, want 1000000", first.Usage.InputTokens)
+	}
+
+	for i := 2; i <= 4; i++ {
+		got := launch()
+		if got.Usage.InputTokens != 1_000_000 {
+			t.Errorf("InputTokens = %d on launch %d, want the unchanged 1000000", got.Usage.InputTokens, i)
+		}
+		amount, known := got.Cost.Amount()
+		if !known {
+			t.Fatalf("launch %d: cost should be known", i)
+		}
+		if amount < 4.99 || amount > 5.01 {
+			t.Errorf("cost = %.2f on launch %d, want the unchanged 5.00", amount, i)
+		}
 	}
 }

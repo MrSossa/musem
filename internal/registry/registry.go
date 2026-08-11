@@ -34,6 +34,14 @@ type BranchResolver interface {
 const (
 	DefaultInterval  = 2 * time.Second
 	DefaultStaleness = 15 * time.Second
+
+	// DefaultBranchTTL is how long a resolved branch is trusted before it is
+	// looked up again. Branches change under musem's feet — switching branch is
+	// among the most ordinary things to do in a working directory — so a cached
+	// name has to expire. It is well above the refresh interval because
+	// resolution shells out to git and the answer is a label, not a figure
+	// anyone acts on within the second.
+	DefaultBranchTTL = 10 * time.Second
 )
 
 // Snapshot is the inventory as of one moment, together with everything the UI
@@ -61,15 +69,23 @@ type Registry struct {
 
 	interval  time.Duration
 	staleness time.Duration
+	branchTTL time.Duration
 	now       func() time.Time
 
 	mu sync.RWMutex
 	// sessions is keyed by the session's own stable identifier. Titles and
 	// paths are user-editable and would collide or churn as keys.
 	sessions    map[string]musem.Session
-	branchByDir map[string]string
+	branchByDir map[string]branchEntry
 	updatedAt   time.Time
 	lastErr     error
+}
+
+// branchEntry is a resolved branch and when it was resolved, so it can be
+// retired rather than believed forever.
+type branchEntry struct {
+	branch     string
+	resolvedAt time.Time
 }
 
 // Option configures a Registry.
@@ -93,6 +109,16 @@ func WithStaleness(d time.Duration) Option {
 	}
 }
 
+// WithBranchTTL sets how long a resolved branch is trusted before it is looked
+// up again.
+func WithBranchTTL(d time.Duration) Option {
+	return func(r *Registry) {
+		if d > 0 {
+			r.branchTTL = d
+		}
+	}
+}
+
 // WithClock replaces the time source, so tests can drive staleness without
 // sleeping.
 func WithClock(now func() time.Time) Option {
@@ -112,9 +138,10 @@ func New(d Discoverer, b BranchResolver, opts ...Option) *Registry {
 		branches:    b,
 		interval:    DefaultInterval,
 		staleness:   DefaultStaleness,
+		branchTTL:   DefaultBranchTTL,
 		now:         time.Now,
 		sessions:    make(map[string]musem.Session),
-		branchByDir: make(map[string]string),
+		branchByDir: make(map[string]branchEntry),
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -214,7 +241,12 @@ func (r *Registry) Refresh(ctx context.Context) {
 }
 
 // resolveBranches returns the branch for every distinct directory in sessions,
-// consulting the cache first and looking up only what is missing.
+// consulting the cache first and looking up whatever is missing or expired.
+//
+// The cache exists to keep musem from shelling out to git once per session per
+// refresh; it is not a record of anything. Entries therefore expire: a user who
+// switches branch must see the new name, and an entry that is never retired
+// would show the old one for as long as musem runs.
 //
 // It must be called without holding the lock: it performs I/O. Newly resolved
 // entries are written back to the cache under a short-lived write lock at the
@@ -222,6 +254,8 @@ func (r *Registry) Refresh(ctx context.Context) {
 func (r *Registry) resolveBranches(ctx context.Context, sessions []musem.Session) map[string]string {
 	out := make(map[string]string, len(sessions))
 	var missing []string
+
+	now := r.now()
 
 	r.mu.RLock()
 	for _, s := range sessions {
@@ -231,8 +265,8 @@ func (r *Registry) resolveBranches(ctx context.Context, sessions []musem.Session
 		if _, done := out[s.Dir]; done {
 			continue
 		}
-		if branch, ok := r.branchByDir[s.Dir]; ok {
-			out[s.Dir] = branch
+		if e, ok := r.branchByDir[s.Dir]; ok && now.Sub(e.resolvedAt) < r.branchTTL {
+			out[s.Dir] = e.branch
 			continue
 		}
 		out[s.Dir] = ""
@@ -244,7 +278,7 @@ func (r *Registry) resolveBranches(ctx context.Context, sessions []musem.Session
 		return out
 	}
 
-	resolved := make(map[string]string, len(missing))
+	resolved := make(map[string]branchEntry, len(missing))
 	for _, dir := range missing {
 		branch, err := r.branches.Branch(ctx, dir)
 		if err != nil {
@@ -254,13 +288,13 @@ func (r *Registry) resolveBranches(ctx context.Context, sessions []musem.Session
 			// would be wildly disproportionate.
 			continue
 		}
-		resolved[dir] = branch
+		resolved[dir] = branchEntry{branch: branch, resolvedAt: now}
 		out[dir] = branch
 	}
 
 	r.mu.Lock()
-	for dir, branch := range resolved {
-		r.branchByDir[dir] = branch
+	for dir, e := range resolved {
+		r.branchByDir[dir] = e
 	}
 	r.mu.Unlock()
 

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/MrSossa/musem"
 )
@@ -21,47 +22,73 @@ type UsageReader struct {
 	// the default location under the user's home directory.
 	ProjectsDir string
 
-	transcripts *TranscriptReader
+	// RetryLookupAfter is how long a failed search is remembered before it is
+	// attempted again. Zero means DefaultRetryLookup.
+	RetryLookupAfter time.Duration
+
+	// transcripts is a value, not a pointer: the reader holds no state, so the
+	// zero value works and there is nothing to construct or to synchronise.
+	transcripts TranscriptReader
+	now         func() time.Time
 
 	mu    sync.Mutex
-	paths map[string]string // sessionID -> resolved transcript path
+	paths map[string]string    // sessionID -> resolved transcript path
+	retry map[string]time.Time // sessionID -> when to search again after a miss
 }
+
+// DefaultRetryLookup is how long a session with no transcript is left alone
+// before musem looks for it again.
+const DefaultRetryLookup = 30 * time.Second
 
 // NewUsageReader returns a reader over the default transcript location.
 func NewUsageReader() *UsageReader {
 	return &UsageReader{
-		transcripts: NewTranscriptReader(),
-		paths:       make(map[string]string),
+		now:   time.Now,
+		paths: make(map[string]string),
+		retry: make(map[string]time.Time),
 	}
 }
 
-// ReadUsage returns usage recorded for a session since the previous call.
-func (r *UsageReader) ReadUsage(_ context.Context, sessionID string) ([]musem.ModelUsage, error) {
+// init prepares a reader built as a composite literal, so setting only the
+// exported fields is enough to get a working one.
+func (r *UsageReader) init() {
+	if r.now == nil {
+		r.now = time.Now
+	}
+	if r.paths == nil {
+		r.paths = make(map[string]string)
+	}
+	if r.retry == nil {
+		r.retry = make(map[string]time.Time)
+	}
+}
+
+// ReadUsage returns usage recorded for a session since cursor.
+func (r *UsageReader) ReadUsage(_ context.Context, sessionID, cursor string) (musem.UsageReading, error) {
 	path, err := r.resolve(sessionID)
 	if err != nil {
-		return nil, err
+		return musem.UsageReading{}, err
 	}
 
-	entries, _, err := r.transcripts.ReadNew(path)
-	if err != nil {
-		return nil, err
-	}
-
-	out := make([]musem.ModelUsage, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, musem.ModelUsage{Model: e.Model, Usage: e.Usage})
-	}
-	return out, nil
+	return r.transcripts.ReadNew(path, cursor)
 }
 
 // resolve finds the transcript for a session, remembering the answer so the
 // search happens once per session rather than on every refresh.
+//
+// A failed search is remembered too, for a while. Sessions are never dropped
+// from the registry, so without this a session whose transcript was deleted
+// would re-scan every project directory on every refresh, forever.
 func (r *UsageReader) resolve(sessionID string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.init()
 
 	if path, ok := r.paths[sessionID]; ok {
 		return path, nil
+	}
+	if until, ok := r.retry[sessionID]; ok && r.now().Before(until) {
+		return "", musem.Errorf(musem.ENOTFOUND, "no transcript found for session %s", sessionID)
 	}
 
 	root := r.ProjectsDir
@@ -75,9 +102,21 @@ func (r *UsageReader) resolve(sessionID string) (string, error) {
 
 	matches, err := filepath.Glob(filepath.Join(root, "*", sessionID+".jsonl"))
 	if err != nil || len(matches) == 0 {
+		// Remembered rather than cached permanently: a session can be seen
+		// before its transcript is written, and giving up on it for good would
+		// leave it uncounted for the rest of the run.
+		r.retry[sessionID] = r.now().Add(r.retryAfter())
 		return "", musem.Errorf(musem.ENOTFOUND, "no transcript found for session %s", sessionID)
 	}
 
+	delete(r.retry, sessionID)
 	r.paths[sessionID] = matches[0]
 	return matches[0], nil
+}
+
+func (r *UsageReader) retryAfter() time.Duration {
+	if r.RetryLookupAfter > 0 {
+		return r.RetryLookupAfter
+	}
+	return DefaultRetryLookup
 }

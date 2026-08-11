@@ -3,23 +3,69 @@ package cost
 import (
 	"context"
 	"math"
+	"strconv"
 	"testing"
 
 	"github.com/MrSossa/musem"
 )
 
+// fakeReader stands in for a transcript reader. Like the real one it keeps no
+// memory of what it has already handed out: the cursor decides, which is what
+// makes it able to model a restart at all.
 type fakeReader struct {
 	bySession map[string][]musem.ModelUsage
+	skipped   int
 	err       error
 }
 
-func (f *fakeReader) ReadUsage(_ context.Context, sessionID string) ([]musem.ModelUsage, error) {
+func (f *fakeReader) ReadUsage(_ context.Context, sessionID, cursor string) (musem.UsageReading, error) {
 	if f.err != nil {
-		return nil, f.err
+		return musem.UsageReading{}, f.err
 	}
-	out := f.bySession[sessionID]
-	f.bySession[sessionID] = nil // subsequent reads see only what is new
+
+	all := f.bySession[sessionID]
+	from := 0
+	if cursor != "" {
+		n, err := strconv.Atoi(cursor)
+		if err != nil {
+			return musem.UsageReading{}, err
+		}
+		from = minInt(n, len(all))
+	}
+
+	return musem.UsageReading{
+		Entries: all[from:],
+		Cursor:  strconv.Itoa(len(all)),
+		Skipped: f.skipped,
+	}, nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// fakeStore is history that survives an Accountant, so a restart can be modelled
+// by building a second one over the same contents.
+type fakeStore struct {
+	rows map[string]musem.SessionCost
+}
+
+func newFakeStore() *fakeStore { return &fakeStore{rows: make(map[string]musem.SessionCost)} }
+
+func (s *fakeStore) Load(context.Context) (map[string]musem.SessionCost, error) {
+	out := make(map[string]musem.SessionCost, len(s.rows))
+	for k, v := range s.rows {
+		out[k] = v
+	}
 	return out, nil
+}
+
+func (s *fakeStore) Save(_ context.Context, sc musem.SessionCost) error {
+	s.rows[sc.SessionID] = sc
+	return nil
 }
 
 func closeTo(t *testing.T, got, want float64) {
@@ -160,6 +206,95 @@ func TestUsageAccumulates(t *testing.T) {
 	}
 	amount, _ := sc.Cost.Amount()
 	closeTo(t, amount, 5.0)
+}
+
+// Restarting musem must resume, not recount. The totals are persisted and the
+// reader's memory is not, so unless the cursor is persisted with them the first
+// pass after startup adds the entire history to the total it just restored —
+// and does it again on every launch after that.
+func TestRestartResumesInsteadOfRecounting(t *testing.T) {
+	usage := map[string][]musem.ModelUsage{
+		"s1": {{Model: "claude-opus-5", Usage: musem.Usage{InputTokens: 1_000_000}}},
+	}
+	store := newFakeStore()
+	ctx := context.Background()
+
+	first := New(NewRateTable(), &fakeReader{bySession: usage}, store)
+	if err := first.Restore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Update(ctx, "s1"); err != nil {
+		t.Fatal(err)
+	}
+
+	before, _ := first.Session("s1")
+	amount, _ := before.Cost.Amount()
+	closeTo(t, amount, 5.0)
+
+	// A second process over the same database and the same unchanged source.
+	second := New(NewRateTable(), &fakeReader{bySession: usage}, store)
+	if err := second.Restore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Update(ctx, "s1"); err != nil {
+		t.Fatal(err)
+	}
+
+	after, _ := second.Session("s1")
+	if after.Usage.InputTokens != 1_000_000 {
+		t.Errorf("InputTokens = %d after a restart, want the original 1000000", after.Usage.InputTokens)
+	}
+	amount, _ = after.Cost.Amount()
+	closeTo(t, amount, 5.0)
+}
+
+// The cursor has to reach the store, because that is the only place it can
+// survive the process that produced it.
+func TestCursorIsPersistedWithTheTotals(t *testing.T) {
+	store := newFakeStore()
+	a := New(NewRateTable(), &fakeReader{bySession: map[string][]musem.ModelUsage{
+		"s1": {{Model: "claude-opus-5", Usage: musem.Usage{InputTokens: 10}}},
+	}}, store)
+
+	if err := a.Update(context.Background(), "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.rows["s1"].Cursor; got != "1" {
+		t.Errorf("persisted cursor = %q, want %q", got, "1")
+	}
+}
+
+// Records that could not be read are usage that was never counted, so the
+// figure beside them understates the truth and has to say so.
+func TestSkippedRecordsAccumulateAndMarkTheCostDegraded(t *testing.T) {
+	reader := &fakeReader{
+		bySession: map[string][]musem.ModelUsage{
+			"s1": {{Model: "claude-opus-5", Usage: musem.Usage{InputTokens: 1_000_000}}},
+		},
+		skipped: 2,
+	}
+	a := New(NewRateTable(), reader, nil)
+	ctx := context.Background()
+
+	if err := a.Update(ctx, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Update(ctx, "s1"); err != nil {
+		t.Fatal(err)
+	}
+
+	sc, _ := a.Session("s1")
+	if sc.Skipped != 4 {
+		t.Errorf("Skipped = %d, want the 4 accumulated across both passes", sc.Skipped)
+	}
+	if !sc.Degraded() {
+		t.Error("a session with unreadable records must report itself degraded")
+	}
+	// Degraded is not partial: these tokens were never counted at all, rather
+	// than counted and left unpriced.
+	if sc.Partial() {
+		t.Error("unreadable records must not be reported as an unpriced model")
+	}
 }
 
 func TestFleetTotal(t *testing.T) {

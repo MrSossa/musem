@@ -2,10 +2,12 @@ package claude
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
-	"sync"
+	"strconv"
 
 	"github.com/MrSossa/musem"
 )
@@ -33,96 +35,127 @@ type transcriptLine struct {
 	} `json:"message"`
 }
 
-// TranscriptReader reads usage from a session's JSONL transcript, remembering
-// how far it got so subsequent reads only cover new lines.
+// TranscriptReader reads usage from a session's JSONL transcript, resuming from
+// a cursor the caller supplies.
 //
 // Transcripts are append-only, which is what makes incremental reading safe: a
-// file that only grows can be resumed from a byte offset.
-type TranscriptReader struct {
-	mu      sync.Mutex
-	offsets map[string]int64
-
-	// warned records paths already reported as malformed, so a permanently
-	// broken transcript produces one diagnostic rather than one per refresh.
-	warned map[string]bool
-}
-
-// NewTranscriptReader returns a reader with no prior state.
-func NewTranscriptReader() *TranscriptReader {
-	return &TranscriptReader{
-		offsets: make(map[string]int64),
-		warned:  make(map[string]bool),
-	}
-}
-
-// ReadNew returns the usage recorded in path since the last call for that path.
+// file that only grows can be resumed from a byte offset. The offset is handed
+// back to the caller rather than kept here, so it can be persisted in the same
+// write as the totals derived from it — an offset that outlives the process but
+// a total that does not, or the reverse, is what makes a restart recount.
 //
-// Lines that cannot be understood are skipped rather than aborting the read: a
-// single malformed record must not cost the caller every other figure in the
-// file. The second return value reports how many lines were skipped, so the
-// caller can surface that something was lost.
-func (r *TranscriptReader) ReadNew(path string) (_ []musem.ModelUsage, skipped int, err error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// The reader holds no state at all, which is what makes it safe to share.
+type TranscriptReader struct{}
 
+// NewTranscriptReader returns a reader.
+func NewTranscriptReader() *TranscriptReader { return &TranscriptReader{} }
+
+// ReadNew returns the usage recorded in path since cursor, together with the
+// cursor to resume from next time.
+//
+// An empty cursor reads from the start. Lines that cannot be understood are
+// skipped rather than aborting the read: a single malformed record must not
+// cost the caller every other figure in the file. The count of skipped lines is
+// reported so the caller can surface that something was lost.
+func (r *TranscriptReader) ReadNew(path, cursor string) (musem.UsageReading, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, 0, musem.Wrap(err, musem.ENOTFOUND, "transcript %s does not exist", path)
+			return musem.UsageReading{}, musem.Wrap(err, musem.ENOTFOUND, "transcript %s does not exist", path)
 		}
-		return nil, 0, musem.Wrap(err, musem.EUNAVAILABLE, "cannot read transcript %s", path)
+		return musem.UsageReading{}, musem.Wrap(err, musem.EUNAVAILABLE, "cannot read transcript %s", path)
 	}
 	defer func() { _ = f.Close() }()
 
 	info, err := f.Stat()
 	if err != nil {
-		return nil, 0, musem.Wrap(err, musem.EUNAVAILABLE, "cannot stat transcript %s", path)
+		return musem.UsageReading{}, musem.Wrap(err, musem.EUNAVAILABLE, "cannot stat transcript %s", path)
 	}
 
-	offset := r.offsets[path]
+	offset := parseCursor(cursor)
+	if cursor == CursorEnd {
+		offset = info.Size()
+	}
 	// A file shorter than where we left off was replaced or truncated, so the
 	// remembered offset is meaningless and the only safe move is to start over.
 	if info.Size() < offset {
 		offset = 0
 	}
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return nil, 0, musem.Wrap(err, musem.EUNAVAILABLE, "cannot seek transcript %s", path)
+		return musem.UsageReading{}, musem.Wrap(err, musem.EUNAVAILABLE, "cannot seek transcript %s", path)
 	}
 
 	usage, skipped, consumed, err := scanUsage(f)
+	reading := musem.UsageReading{
+		Entries: usage,
+		Cursor:  formatCursor(offset + consumed),
+		Skipped: skipped,
+	}
 	if err != nil {
-		return nil, skipped, err
+		return reading, err
 	}
-	r.offsets[path] = offset + consumed
-
-	return usage, skipped, nil
+	return reading, nil
 }
 
-// ShouldWarn reports whether a diagnostic for path has not been emitted yet,
-// marking it as emitted. It exists so a permanently malformed transcript is
-// reported once instead of on every refresh.
-func (r *TranscriptReader) ShouldWarn(path string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.warned[path] {
-		return false
+// CursorEnd resumes from wherever the transcript currently ends, counting
+// nothing before it. It exists for accounting that was carried forward from
+// somewhere with no cursor of its own, where the stored total is already
+// believed complete and re-reading the file would add it to itself.
+const CursorEnd = "end"
+
+// parseCursor turns a cursor back into a byte offset. Anything unrecognised
+// reads as "start from the beginning", which recounts rather than skips: an
+// inflated total is visible and correctable, silently missing usage is not.
+func parseCursor(cursor string) int64 {
+	if cursor == "" {
+		return 0
 	}
-	r.warned[path] = true
-	return true
+	offset, err := strconv.ParseInt(cursor, 10, 64)
+	if err != nil || offset < 0 {
+		return 0
+	}
+	return offset
 }
+
+func formatCursor(offset int64) string { return strconv.FormatInt(offset, 10) }
+
+// maxTranscriptLine bounds how much of a single record is held in memory.
+// Transcript lines carry whole messages and are routinely far larger than a
+// default scanner buffer; a line beyond even this is treated as corrupt rather
+// than read, so a file that turns out to contain no newlines at all cannot
+// exhaust memory.
+const maxTranscriptLine = 8 << 20
 
 // scanUsage reads usage entries from rd, returning how many bytes were consumed
 // so the caller can resume exactly where parsing stopped.
+//
+// Only whole, newline-terminated lines are counted as consumed. musem reads
+// transcripts while the agent is still appending to them, so a read landing
+// mid-line is routine rather than exceptional: the trailing fragment is left
+// where it is and picked up once the writer has finished it. Counting it as
+// consumed would step over the completed record and lose its usage for good.
 func scanUsage(rd io.Reader) (usage []musem.ModelUsage, skipped int, consumed int64, err error) {
-	scanner := bufio.NewScanner(rd)
-	// Transcript lines carry whole messages and can be far larger than the
-	// default 64 KiB scanner limit.
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	br := bufio.NewReaderSize(rd, 64*1024)
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		consumed += int64(len(line)) + 1 // +1 for the newline the scanner strips
+	for {
+		line, n, oversize, readErr := readLine(br)
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				// A fragment at the end is not a line yet, so its bytes stay
+				// uncounted and the next read starts at the same place.
+				return usage, skipped, consumed, nil
+			}
+			return usage, skipped, consumed, musem.Wrap(readErr, musem.EUNPARSEABLE, "reading transcript")
+		}
+		consumed += n
 
+		if oversize {
+			skipped++
+			continue
+		}
+		// Trailing carriage returns are stripped along with the newline so a
+		// transcript written with CRLF endings parses as JSON.
+		line = bytes.TrimRight(line, "\r\n")
 		if len(line) == 0 {
 			continue
 		}
@@ -162,9 +195,45 @@ func scanUsage(rd io.Reader) (usage []musem.ModelUsage, skipped int, consumed in
 
 		usage = append(usage, musem.ModelUsage{Model: entry.Message.Model, Usage: mu})
 	}
+}
 
-	if err := scanner.Err(); err != nil {
-		return usage, skipped, consumed, musem.Wrap(err, musem.EUNPARSEABLE, "reading transcript")
+// readLine returns the next newline-terminated line together with its length on
+// disk, including the newline. The returned slice is only valid until the next
+// call, which is why every caller finishes with it before reading on.
+//
+// An oversize line is consumed and discarded rather than buffered: its bytes
+// still have to be stepped over, but nothing requires holding them.
+func readLine(br *bufio.Reader) (line []byte, n int64, oversize bool, err error) {
+	for {
+		chunk, err := br.ReadSlice('\n')
+		n += int64(len(chunk))
+
+		switch {
+		case errors.Is(err, bufio.ErrBufferFull):
+			// The line spans more than one buffer, so it has to be copied out
+			// before the next read overwrites it.
+			if oversize || len(line)+len(chunk) > maxTranscriptLine {
+				oversize = true
+				line = nil
+				continue
+			}
+			line = append(line, chunk...)
+			continue
+
+		case err != nil:
+			// Includes io.EOF, which here means a trailing fragment with no
+			// newline. The caller discards n along with it.
+			return nil, n, oversize, err
+
+		case oversize:
+			return nil, n, true, nil
+
+		case line == nil:
+			// The whole line arrived in one piece; no copy needed.
+			return chunk, n, false, nil
+
+		default:
+			return append(line, chunk...), n, false, nil
+		}
 	}
-	return usage, skipped, consumed, nil
 }

@@ -101,41 +101,32 @@ func (r BranchResolver) Branch(_ context.Context, dir string) (string, error) {
 // UsageReader reports fabricated usage, so the cost column has something to
 // show during development.
 //
-// State is per instance rather than per package: two readers must not share a
-// memory of what they have already reported, or a second consumer silently sees
-// nothing. That is the same no-package-level-globals rule the rest of the
-// project follows, and a test double is not exempt from it.
-type UsageReader struct {
-	mu   sync.Mutex
-	seen map[string]bool
-}
+// It remembers nothing: what has already been reported is decided entirely by
+// the cursor it is handed, which is the same contract the real reader honours.
+// A double that kept its own memory would still report a fresh sample after a
+// restart — and would therefore hide the very bug the cursor exists to prevent.
+type UsageReader struct{}
 
-// NewUsageReader returns a reader with no prior state.
-func NewUsageReader() *UsageReader {
-	return &UsageReader{seen: make(map[string]bool)}
-}
+// NewUsageReader returns a reader.
+func NewUsageReader() *UsageReader { return &UsageReader{} }
 
-// ReadUsage returns a fixed sample the first time a session is asked about and
+// ReadUsage returns a fixed sample for a session read from the start and
 // nothing afterwards, mimicking a transcript that is read incrementally.
-func (r *UsageReader) ReadUsage(_ context.Context, sessionID string) ([]musem.ModelUsage, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if r.seen == nil {
-		r.seen = make(map[string]bool)
+func (r *UsageReader) ReadUsage(_ context.Context, _, cursor string) (musem.UsageReading, error) {
+	if cursor != "" {
+		return musem.UsageReading{Cursor: cursor}, nil
 	}
-	if r.seen[sessionID] {
-		return nil, nil
-	}
-	r.seen[sessionID] = true
 
-	return []musem.ModelUsage{{
-		Model: "claude-opus-5",
-		Usage: musem.Usage{
-			InputTokens:        1_200,
-			OutputTokens:       3_400,
-			CacheWrite1hTokens: 26_177,
-			CacheReadTokens:    120_000,
-		},
-	}}, nil
+	return musem.UsageReading{
+		Entries: []musem.ModelUsage{{
+			Model: "claude-opus-5",
+			Usage: musem.Usage{
+				InputTokens:        1_200,
+				OutputTokens:       3_400,
+				CacheWrite1hTokens: 26_177,
+				CacheReadTokens:    120_000,
+			},
+		}},
+		Cursor: "read",
+	}, nil
 }

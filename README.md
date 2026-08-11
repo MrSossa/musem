@@ -59,10 +59,15 @@ crash.
 
 musem reads agent transcripts, which contain your source code and your prompts.
 All processing is local and musem originates no network traffic — a property
-asserted by a test (`internal/archtest`), not merely promised here.
+asserted by a test (`internal/archtest`), not merely promised here. The test
+walks the whole dependency graph, not just the imports musem writes itself, so
+a dependency cannot do the reaching on its behalf. Musem's own code imports no
+networking package at all.
 
 Accumulated cost is kept in SQLite under your config directory, so history
-survives both a restart and the transcripts being rotated away.
+survives both a restart and the transcripts being rotated away. How far each
+transcript has been read is stored in the same row as the total it produced, so
+a restart resumes where it left off rather than counting the same tokens again.
 
 ## Development
 

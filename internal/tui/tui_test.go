@@ -281,3 +281,106 @@ func TestDashboardHasNoMutatingOperations(t *testing.T) {
 		}
 	}
 }
+
+// Ctrl-C means "stop this program" everywhere else in a terminal. A pane that
+// swallows it leaves the user pressing it harder at something that has decided
+// it means "close a pane".
+func TestCtrlCQuitsEvenWithAPaneOpen(t *testing.T) {
+	base := withSnapshot(NewModel(), snapshot(row("a", "api", musem.StatusIdle)))
+
+	for _, tc := range []struct {
+		name string
+		open func(Model) Model
+	}{
+		{"nothing open", func(m Model) Model { return m }},
+		{"help open", func(m Model) Model { return press(m, "?") }},
+		{"detail open", func(m Model) Model {
+			next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			return next.(Model)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := tc.open(base)
+			_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+			if cmd == nil {
+				t.Fatal("ctrl-c must produce a command")
+			}
+			if _, ok := cmd().(tea.QuitMsg); !ok {
+				t.Error("ctrl-c must quit whatever is on screen")
+			}
+		})
+	}
+}
+
+// Drawing every row regardless of height scrolls the header, the fleet total
+// and the selection indicator out of the alt-screen buffer — on a dashboard
+// whose whole purpose is surfacing the session that is waiting on you.
+func TestTableFitsTheTerminalAndFollowsTheCursor(t *testing.T) {
+	rows := make([]app.Row, 0, 30)
+	for i := 0; i < 30; i++ {
+		rows = append(rows, row(string(rune('a'+i%26))+string(rune('0'+i/26)), "svc"+string(rune('a'+i%26)), musem.StatusIdle))
+	}
+
+	m := withSnapshot(NewModel(), snapshot(rows...))
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+	m = next.(Model)
+
+	if got := lineCount(m.View()); got > 24 {
+		t.Errorf("the view is %d lines in a 24-line terminal", got)
+	}
+
+	// The fleet total lives in the header and must survive.
+	if !strings.Contains(m.View(), "30 sessions") {
+		t.Error("the header scrolled away")
+	}
+
+	// The selection indicator has to stay on screen wherever the cursor goes.
+	for _, key := range []string{"G", "g"} {
+		m = press(m, key)
+		if !strings.Contains(m.View(), "▸") {
+			t.Errorf("the cursor is off screen after %q", key)
+		}
+		if got := lineCount(m.View()); got > 24 {
+			t.Errorf("the view is %d lines after %q, want at most 24", got, key)
+		}
+	}
+
+	m = press(m, "G")
+	if !strings.Contains(m.View(), "of 30") {
+		t.Error("a scrolled list must say that it continues past the screen")
+	}
+}
+
+// A terminal whose height is unknown must still draw something.
+func TestTableWithoutAKnownHeightDrawsEveryRow(t *testing.T) {
+	rows := make([]app.Row, 0, 12)
+	for i := 0; i < 12; i++ {
+		rows = append(rows, row(string(rune('a'+i)), "svc"+string(rune('a'+i)), musem.StatusIdle))
+	}
+
+	m := withSnapshot(NewModel(), snapshot(rows...))
+	view := m.View()
+	for i := 0; i < 12; i++ {
+		if !strings.Contains(view, "svc"+string(rune('a'+i))) {
+			t.Fatalf("row %d is missing when the height is unknown", i)
+		}
+	}
+}
+
+// A figure that was never counted is not the same as one that could not be
+// priced, and the difference has to be visible.
+func TestDegradedCostIsMarkedDistinctlyFromPartial(t *testing.T) {
+	degraded := row("a", "api", musem.StatusIdle)
+	degraded.Degraded = true
+	partial := row("b", "web", musem.StatusIdle)
+	partial.Partial = true
+
+	view := withSnapshot(NewModel(), snapshot(degraded, partial)).View()
+
+	if !strings.Contains(view, "$1.50!") {
+		t.Error("a cost missing unreadable records must be flagged")
+	}
+	if !strings.Contains(view, "$1.50*") {
+		t.Error("an unpriced cost must keep its own marker")
+	}
+}

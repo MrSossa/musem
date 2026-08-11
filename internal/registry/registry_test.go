@@ -334,3 +334,55 @@ func (s *slowDiscoverer) Discover(context.Context) ([]musem.Session, error) {
 	s.onCall()
 	return nil, errors.New("no sessions")
 }
+
+// countingBranches records how often it is asked, so the cache can be shown to
+// be doing its job as well as expiring.
+type countingBranches struct {
+	byDir map[string]string
+	calls int
+}
+
+func (c *countingBranches) Branch(_ context.Context, dir string) (string, error) {
+	c.calls++
+	return c.byDir[dir], nil
+}
+
+// Switching branch is among the most ordinary things to do in a working
+// directory. A cached name that never expires would show the old branch for as
+// long as musem runs.
+func TestBranchCacheExpires(t *testing.T) {
+	d := &fakeDiscoverer{sessions: []musem.Session{
+		session("a", "alpha", "/p/alpha", musem.StatusIdle),
+	}}
+	b := &countingBranches{byDir: map[string]string{"/p/alpha": "feat/rate-limit"}}
+
+	now := time.Now()
+	r := New(d, b,
+		WithBranchTTL(10*time.Second),
+		WithClock(func() time.Time { return now }),
+	)
+	ctx := context.Background()
+
+	r.Refresh(ctx)
+	if got := r.Snapshot().Sessions[0].Branch; got != "feat/rate-limit" {
+		t.Fatalf("branch = %q, want feat/rate-limit", got)
+	}
+
+	// Within the window the cache answers and git is left alone.
+	r.Refresh(ctx)
+	if b.calls != 1 {
+		t.Errorf("resolver called %d times within the TTL, want 1", b.calls)
+	}
+
+	b.byDir["/p/alpha"] = "main"
+	r.Refresh(ctx)
+	if got := r.Snapshot().Sessions[0].Branch; got != "feat/rate-limit" {
+		t.Errorf("branch = %q before the TTL elapsed, want the cached feat/rate-limit", got)
+	}
+
+	now = now.Add(11 * time.Second)
+	r.Refresh(ctx)
+	if got := r.Snapshot().Sessions[0].Branch; got != "main" {
+		t.Errorf("branch = %q after the TTL elapsed, want main", got)
+	}
+}

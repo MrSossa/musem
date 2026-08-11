@@ -81,6 +81,23 @@ var migrations = []string{
 		unknown_models       TEXT    NOT NULL DEFAULT '[]',
 		updated_at           TEXT    NOT NULL DEFAULT (datetime('now'))
 	)`,
+
+	// The cursor records how far the source record had been read when these
+	// totals were written. It is stored in the same row, and therefore the same
+	// write, precisely so the two cannot disagree: totals that survive a restart
+	// while their cursor does not are what makes a restart recount usage it has
+	// already billed for.
+	`ALTER TABLE session_costs ADD COLUMN read_cursor TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE session_costs ADD COLUMN skipped_records INTEGER NOT NULL DEFAULT 0`,
+
+	// Rows written before the column existed have totals but no cursor, and an
+	// empty cursor means "from the start" — which would add their whole history
+	// to itself once. They are resumed from wherever their source record has
+	// reached instead: the stored total is kept as the truth for everything
+	// before now, at the cost of anything appended since the last write, which
+	// is bounded by one refresh interval. Counting a session twice is a wrong
+	// number that looks right; losing a couple of seconds is neither.
+	`UPDATE session_costs SET read_cursor = 'end' WHERE read_cursor = ''`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -120,8 +137,9 @@ func (s *Store) Save(ctx context.Context, sc musem.SessionCost) error {
 		INSERT INTO session_costs (
 			session_id, input_tokens, output_tokens,
 			cache_write_5m, cache_write_1h, cache_read_tokens,
-			cost_usd, cost_known, unknown_models, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+			cost_usd, cost_known, unknown_models,
+			read_cursor, skipped_records, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
 		ON CONFLICT(session_id) DO UPDATE SET
 			input_tokens      = excluded.input_tokens,
 			output_tokens     = excluded.output_tokens,
@@ -131,11 +149,14 @@ func (s *Store) Save(ctx context.Context, sc musem.SessionCost) error {
 			cost_usd          = excluded.cost_usd,
 			cost_known        = excluded.cost_known,
 			unknown_models    = excluded.unknown_models,
+			read_cursor       = excluded.read_cursor,
+			skipped_records   = excluded.skipped_records,
 			updated_at        = excluded.updated_at`,
 		sc.SessionID,
 		sc.Usage.InputTokens, sc.Usage.OutputTokens,
 		sc.Usage.CacheWrite5mTokens, sc.Usage.CacheWrite1hTokens, sc.Usage.CacheReadTokens,
 		amount, boolToInt(known), string(unknown),
+		sc.Cursor, sc.Skipped,
 	)
 	if err != nil {
 		return musem.Wrap(err, musem.EUNAVAILABLE, "cannot save usage for session %s", sc.SessionID)
@@ -148,7 +169,8 @@ func (s *Store) Load(ctx context.Context) (map[string]musem.SessionCost, error) 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT session_id, input_tokens, output_tokens,
 		       cache_write_5m, cache_write_1h, cache_read_tokens,
-		       cost_usd, cost_known, unknown_models
+		       cost_usd, cost_known, unknown_models,
+		       read_cursor, skipped_records
 		FROM session_costs`)
 	if err != nil {
 		return nil, musem.Wrap(err, musem.EUNAVAILABLE, "cannot read usage history")
@@ -168,6 +190,7 @@ func (s *Store) Load(ctx context.Context) (map[string]musem.SessionCost, error) 
 			&sc.Usage.InputTokens, &sc.Usage.OutputTokens,
 			&sc.Usage.CacheWrite5mTokens, &sc.Usage.CacheWrite1hTokens, &sc.Usage.CacheReadTokens,
 			&amount, &known, &unknown,
+			&sc.Cursor, &sc.Skipped,
 		); err != nil {
 			return nil, musem.Wrap(err, musem.EUNPARSEABLE, "malformed history row")
 		}

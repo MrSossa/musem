@@ -102,6 +102,20 @@ func run(fake bool, interval time.Duration) error {
 	go tui.Pump(ctx, program, composer, interval)
 
 	_, err := program.Run()
+	return shutdownError(err, ctx.Err())
+}
+
+// shutdownError decides whether the UI loop stopping was a failure.
+//
+// Being asked to stop is not one. bubbletea reports a cancelled context as
+// ErrProgramKilled, the same error it uses for a genuine kill, so the state of
+// the signal context is what tells the two apart. Without this, a supervisor
+// stopping musem with SIGTERM sees a non-zero exit and an error on stderr for
+// what was an orderly shutdown.
+func shutdownError(err, ctxErr error) error {
+	if errors.Is(err, tea.ErrProgramKilled) && ctxErr != nil {
+		return nil
+	}
 	return err
 }
 

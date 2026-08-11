@@ -14,12 +14,15 @@ import (
 	"github.com/MrSossa/musem"
 )
 
-// UsageReader reports usage recorded for a session since it was last read.
+// UsageReader reports usage recorded for a session since the given cursor,
+// returning the cursor to resume from next time.
 //
 // Declared here by the consumer: cost states what it needs and stays ignorant
-// of transcripts, files, and the tool that wrote them.
+// of transcripts, files, and the tool that wrote them. The cursor is opaque
+// here for the same reason — the accountant stores it and hands it back, and
+// never asks what it means.
 type UsageReader interface {
-	ReadUsage(ctx context.Context, sessionID string) ([]musem.ModelUsage, error)
+	ReadUsage(ctx context.Context, sessionID, cursor string) (musem.UsageReading, error)
 }
 
 // HistoryStore persists accumulated usage so it survives both a restart and the
@@ -34,6 +37,12 @@ type Accountant struct {
 	rates  *RateTable
 	reader UsageReader
 	store  HistoryStore
+
+	// updateMu serialises the read-modify-write in Update. The data lock cannot
+	// do it: reading usage is I/O, and holding a lock the UI needs across it
+	// would show up on screen as a freeze. Without this, two passes could both
+	// read from the same cursor and count the same tokens twice.
+	updateMu sync.Mutex
 
 	mu    sync.RWMutex
 	costs map[string]musem.SessionCost
@@ -74,19 +83,32 @@ func (a *Accountant) Restore(ctx context.Context) error {
 // Update folds any newly recorded usage for a session into its running total.
 //
 // Usage already counted is never recomputed — it is accumulated. That is what
-// lets the total survive the source record being deleted.
+// lets the total survive the source record being deleted. The reader is told
+// where the last pass stopped, and where this one stopped is saved in the same
+// write as the total it produced: a total that persists while its cursor does
+// not is exactly how a restart ends up counting the same tokens twice.
 func (a *Accountant) Update(ctx context.Context, sessionID string) error {
-	fresh, err := a.reader.ReadUsage(ctx, sessionID)
+	a.updateMu.Lock()
+	defer a.updateMu.Unlock()
+
+	a.mu.RLock()
+	cursor := a.costs[sessionID].Cursor
+	a.mu.RUnlock()
+
+	reading, err := a.reader.ReadUsage(ctx, sessionID, cursor)
 	if err != nil {
 		return err
 	}
-	if len(fresh) == 0 {
+	if len(reading.Entries) == 0 && reading.Skipped == 0 && reading.Cursor == cursor {
 		return nil
 	}
+	fresh := reading.Entries
 
 	a.mu.Lock()
 	sc := a.costs[sessionID]
 	sc.SessionID = sessionID
+	sc.Cursor = reading.Cursor
+	sc.Skipped += reading.Skipped
 
 	unknown := make(map[string]bool, len(sc.UnknownModels))
 	for _, m := range sc.UnknownModels {

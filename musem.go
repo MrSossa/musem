@@ -216,6 +216,31 @@ type ModelUsage struct {
 	Usage Usage
 }
 
+// UsageReading is what one pass over a session's usage record yielded.
+//
+// It lives in the domain because both the adapter that produces it and the
+// package that consumes it need to name it, and neither may depend on the
+// other.
+type UsageReading struct {
+	// Entries is the usage recorded since the cursor the reader was given.
+	Entries []ModelUsage
+
+	// Cursor is where the next read should resume. It is opaque to everyone
+	// except the reader that issued it: only that reader knows whether it
+	// encodes a byte offset, a record number, or nothing at all.
+	//
+	// It is returned rather than remembered inside the reader so it can be
+	// persisted in the same write as the totals it corresponds to. A cursor
+	// held only in memory is lost on restart, and re-reading a record that has
+	// already been counted inflates the total it is added to.
+	Cursor string
+
+	// Skipped counts records that were passed over because they could not be
+	// understood. The usage they carried is gone, so a non-zero count means the
+	// figures beside it understate the truth and must say so.
+	Skipped int
+}
+
 // SessionCost is the accounting for one session.
 type SessionCost struct {
 	SessionID string
@@ -226,7 +251,20 @@ type SessionCost struct {
 	// non-empty the tokens were still counted but Cost is unknown, and naming
 	// the models is what makes the gap actionable.
 	UnknownModels []string
+
+	// Cursor is how far the source record has been counted, persisted alongside
+	// the totals it produced so a restart resumes instead of recounting.
+	Cursor string
+
+	// Skipped is how many records have been passed over as unreadable across
+	// every pass. Tokens they carried were never counted.
+	Skipped int
 }
 
 // Partial reports whether some part of this cost could not be priced.
 func (sc SessionCost) Partial() bool { return len(sc.UnknownModels) > 0 || !sc.Cost.Known() }
+
+// Degraded reports whether some usage was lost to records that could not be
+// read. Distinct from Partial: partial means counted but unpriceable, degraded
+// means never counted at all.
+func (sc SessionCost) Degraded() bool { return sc.Skipped > 0 }

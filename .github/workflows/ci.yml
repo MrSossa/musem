@@ -12,8 +12,8 @@ env:
   CGO_ENABLED: "0"
 
 jobs:
-  ci:
-    name: ci (${{ matrix.os }})
+  test:
+    name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -74,3 +74,28 @@ jobs:
       - uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+
+  # The branch ruleset requires a status check whose context is exactly "ci".
+  # A matrix job cannot provide one: GitHub appends the matrix values to every
+  # context it reports, so the jobs above show up as "test (ubuntu-latest)" and
+  # "test (macos-latest)" and nothing ever reports the bare name. This job is
+  # that name, and it collapses the others into it.
+  #
+  # if: always() is load-bearing. Without it a failing dependency leaves this
+  # job skipped rather than failed, which reports no status at all — and a pull
+  # request waiting forever for a check that will never arrive looks exactly
+  # like a slow CI run, not like a broken one.
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    if: always()
+    steps:
+      - name: verify that every required job succeeded
+        run: |
+          echo "test: ${{ needs.test.result }}"
+          echo "lint: ${{ needs.lint.result }}"
+          if [ "${{ needs.test.result }}" != "success" ] || [ "${{ needs.lint.result }}" != "success" ]; then
+            echo "a required job did not succeed"
+            exit 1
+          fi
