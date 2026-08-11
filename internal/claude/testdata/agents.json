@@ -1,0 +1,29 @@
+[
+  {
+    "pid": 9559,
+    "cwd": "/home/dev/projects/alpha",
+    "kind": "interactive",
+    "startedAt": 1785170889522,
+    "sessionId": "27fa386e-4411-40aa-8daf-47a6a21cbc7b",
+    "name": "alpha-01",
+    "status": "idle"
+  },
+  {
+    "pid": 97971,
+    "cwd": "/home/dev/projects/beta",
+    "kind": "interactive",
+    "startedAt": 1785185174885,
+    "sessionId": "8cbc1a45-44f9-42e0-9245-0a41bc19d73d",
+    "name": "beta",
+    "status": "busy"
+  },
+  {
+    "pid": 2055049,
+    "cwd": "/home/dev/projects/alpha",
+    "kind": "interactive",
+    "startedAt": 1786287490233,
+    "sessionId": "cbd73f81-409b-4ff4-99e1-2b48c21c93bf",
+    "name": "alpha-02",
+    "status": "waiting"
+  }
+]

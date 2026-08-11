@@ -5,18 +5,16 @@
 .env.*
 !.env.example
 
-node_modules/
+# Go
+bin/
 dist/
-build/
-coverage/
-
-__pycache__/
-*.py[cod]
-.venv/
-venv/
+*.exe
+*.test
+*.out
+coverage.txt
 
 .idea/
 .vscode/
 
-# Los comandos/skills de OpenSpec viven en ~/.claude (config global del usuario)
+# OpenSpec commands/skills live in ~/.claude (the user's global config)
 .claude/

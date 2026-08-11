@@ -1,0 +1,5 @@
+{"type":"assistant","message":{"id":"msg_1","model":"claude-opus-5","usage":{"input_tokens":5,"output_tokens":50}},"uuid":"a1"}
+this line is not json at all
+{"type":"assistant","message":{"id":"msg_2","model":"claude-opus-5","usage":{"input_tokens":"not-a-number","output_tokens":10}},"uuid":"a2"}
+{"type":"assistant","message":{"id":"msg_3","role":"assistant","content":[]},"uuid":"a3"}
+{"type":"assistant","message":{"id":"msg_4","model":"claude-opus-5","usage":{"input_tokens":3,"output_tokens":7}},"uuid":"a4"}

@@ -5,12 +5,72 @@ on:
   push:
     branches: [main]
 
+# CGO_ENABLED=0 is a project invariant, not a convenience: it is what keeps
+# cross-compilation to macOS and Linux possible from a single machine. Pinned
+# here so a regression fails the build instead of being noticed months later.
+env:
+  CGO_ENABLED: "0"
+
 jobs:
   ci:
-    name: ci
+    name: ci (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      # Tests run twice on purpose. First in the configuration we ship, to prove
+      # the code works with cgo off; then under the race detector, which needs
+      # cgo and therefore cannot run at CGO_ENABLED=0. The invariant is about
+      # the binary we distribute, not about the test runner.
+      - name: test (shipping configuration)
+        run: go test ./...
+
+      - name: test (race detector)
+        run: go test -race ./...
+        env:
+          CGO_ENABLED: "1"
+
+      - name: build
+        run: go build -o bin/musem ./cmd/musem
+
+      - name: assert the binary is statically linked
+        run: |
+          if go tool nm bin/musem 2>/dev/null | grep -q ' U _cgo'; then
+            echo "binary contains cgo references: CGO_ENABLED=0 was not honoured"
+            exit 1
+          fi
+          echo "no cgo references found"
+
+  lint:
+    name: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Placeholder: añade aquí lint / tests del proyecto.
-      - name: Check
-        run: echo "sin checks configurados todavía"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
