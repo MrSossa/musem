@@ -17,6 +17,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/MrSossa/musem"
@@ -59,13 +60,52 @@ type Store struct {
 	db *sql.DB
 }
 
+// dsnPragmas are the settings every connection is opened with. Busy timeout so
+// a concurrent musem waits briefly rather than failing outright; WAL so a reader
+// is never blocked by a writer.
+const dsnPragmas = "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+
+// dsn builds the connection string for a database file, refusing a path the
+// driver would read as something other than a filename.
+//
+// The path is concatenated in front of a query string, and a path is an
+// arbitrary filename where a DSN is closer to a URL — so the two disagree about
+// one ordinary character. The driver splits at the first "?" it finds, so a "?"
+// in a directory name starts the query early: the filename is cut short there
+// and every pragma below it lands in the wrong half. It does not fail to open.
+// It hands back a working database at a path nobody asked for, configured with
+// settings nobody chose, which is how a busy timeout that was never applied
+// becomes a lost write with no explanation attached to it.
+//
+// Only "?" is refused, and the list is deliberately no longer than that. A "#"
+// looks like it belongs here and does not: the driver passes the filename to
+// sqlite3_open_v2 with SQLITE_OPEN_URI set, but SQLite only parses a name as a
+// URI when it begins with "file:", which this one never does — so a "#" is an
+// ordinary character in an ordinary filename and the database opens where it
+// should, pragmas intact. Refusing it would reject a path that works.
+//
+// Refused rather than escaped. Escaping means reimplementing the driver's own
+// parsing from the outside and staying in step with it, to rescue a filename
+// nobody has: this path comes from the user's config directory. An error names
+// the problem and the user moves the directory; a silent misconfiguration is the
+// failure mode this whole package is arranged against.
+func dsn(path string) (string, error) {
+	if strings.ContainsRune(path, '?') {
+		return "", musem.Errorf(musem.EINVALID,
+			`the history database path %s contains "?", which cannot be opened safely`,
+			path)
+	}
+	return path + "?" + dsnPragmas, nil
+}
+
 // Open opens the database at path, creating and migrating it as needed.
 func Open(ctx context.Context, path string) (*Store, error) {
-	// Busy timeout so a concurrent musem waits briefly rather than failing
-	// outright; WAL so a reader is never blocked by a writer.
-	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	source, err := dsn(path)
+	if err != nil {
+		return nil, err
+	}
 
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", source)
 	if err != nil {
 		return nil, musem.Wrap(err, musem.EUNAVAILABLE, "cannot open the history database")
 	}

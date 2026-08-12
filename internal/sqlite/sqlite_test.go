@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -456,6 +457,81 @@ func TestConcurrentOpensAllMigrateCleanly(t *testing.T) {
 		}
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
+		}
+	}
+}
+
+// A path is an arbitrary filename; a DSN is closer to a URL. Where the two
+// disagree the database still opens, but at a path nobody asked for and with
+// settings nobody chose — so the path is refused rather than silently
+// reinterpreted.
+func TestOpenRefusesAPathTheDriverWouldMisread(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mu?sem.db")
+
+	store, err := Open(context.Background(), path)
+	if err == nil {
+		_ = store.Close()
+		t.Fatalf("Open(%q) succeeded; it would have opened %q with the pragmas dropped",
+			path, filepath.Join(dir, "mu"))
+	}
+	if got := musem.ErrorCode(err); got != musem.EINVALID {
+		t.Errorf("Open(%q) code = %q, want %q", path, got, musem.EINVALID)
+	}
+}
+
+// The refusal above covers exactly one character, and this is what keeps the
+// list from growing on suspicion. A "#" looks like it belongs there and does
+// not: the driver only parses a name as a URI when it begins with "file:", so a
+// "#" is an ordinary character in an ordinary filename. Refusing it would reject
+// a path that works — which this proves it does, pragmas and all.
+func TestOpenAcceptsAPathTheDriverReadsLiterally(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "musem#1.db")
+
+	store, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", path, err)
+	}
+	defer func() { _ = store.Close() }()
+
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("the database must be created at the path given: %v", err)
+	}
+
+	var mode string
+	if err := store.db.QueryRow("pragma journal_mode").Scan(&mode); err != nil {
+		t.Fatalf("pragma journal_mode: %v", err)
+	}
+	if mode != "wal" {
+		t.Errorf("journal_mode = %q, want %q; the pragmas were dropped", mode, "wal")
+	}
+
+	var busy int
+	if err := store.db.QueryRow("pragma busy_timeout").Scan(&busy); err != nil {
+		t.Fatalf("pragma busy_timeout: %v", err)
+	}
+	if busy != 5000 {
+		t.Errorf("busy_timeout = %d, want 5000; the pragmas were dropped", busy)
+	}
+}
+
+// The pragmas are what the refusal above protects, so assert they are actually
+// there for an ordinary path.
+func TestDSNCarriesThePragmas(t *testing.T) {
+	got, err := dsn("/tmp/musem.db")
+	if err != nil {
+		t.Fatalf("dsn: %v", err)
+	}
+
+	for _, want := range []string{
+		"/tmp/musem.db?",
+		"busy_timeout(5000)",
+		"journal_mode(WAL)",
+		"foreign_keys(1)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("dsn = %q, want it to contain %q", got, want)
 		}
 	}
 }
