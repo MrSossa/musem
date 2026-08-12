@@ -526,3 +526,24 @@ func TestFinalReadRetriesAreBoundedByTime(t *testing.T) {
 		t.Errorf("an unreadable ended session was chased %d more times after the grace expired", got-settled)
 	}
 }
+
+// The count has to survive the whole path — adapter, registry, composer, view —
+// because every hop it does not cross is a hop where an incomplete inventory
+// starts looking like a complete one.
+func TestUnreadRecordsReachTheView(t *testing.T) {
+	discoverer := inmem.NewDiscoverer()
+	discoverer.Skipped = 3
+	reg := registry.New(discoverer, inmem.BranchResolver{})
+	reg.Refresh(context.Background())
+
+	composer := app.New(reg, cost.New(cost.NewRateTable(), inmem.NewUsageReader(), nil))
+	snap := composer.Snapshot()
+	if snap.Undiscovered != 3 {
+		t.Fatalf("Undiscovered = %d, want 3", snap.Undiscovered)
+	}
+
+	model, _ := tui.NewModel().Update(tui.SnapshotMsg{Snapshot: snap})
+	if view := model.View(); !strings.Contains(view, "could not be read") {
+		t.Errorf("the view does not report the records that were dropped:\n%s", view)
+	}
+}

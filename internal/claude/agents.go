@@ -8,15 +8,14 @@
 package claude
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/MrSossa/musem"
+	"github.com/MrSossa/musem/internal/execx"
 )
 
 // agentRecord mirrors one entry of `claude agents --json`. Unknown fields are
@@ -49,7 +48,7 @@ func NewDiscoverer() *Discoverer {
 //
 // A missing CLI is reported as EUNAVAILABLE rather than as a generic failure,
 // because the dashboard's job in that case is to stay up and explain itself.
-func (d *Discoverer) Discover(ctx context.Context) ([]musem.Session, error) {
+func (d *Discoverer) Discover(ctx context.Context) (musem.Discovery, error) {
 	bin := d.Bin
 	if bin == "" {
 		bin = "claude"
@@ -59,71 +58,41 @@ func (d *Discoverer) Discover(ctx context.Context) ([]musem.Session, error) {
 		timeout = 15 * time.Second
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	var stdout, stderr bytes.Buffer
-	// The binary is a variable, which is what gosec objects to, but nothing an
-	// attacker reaches: it is a field on this struct, defaulted to "claude" and
-	// set only by the code that wires the adapter up. The arguments beside it are
-	// constants, and there is no shell — exec.CommandContext passes an argv, so a
-	// binary name carrying spaces or metacharacters is a filename that will not
-	// be found, not a second command. Resolving it via PATH is the intent: musem
-	// runs the CLI the user's own shell would.
-	// #nosec G204 -- bin is a configured field, never external input; argv, no shell
-	cmd := exec.CommandContext(ctx, bin, "agents", "--json")
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	// Killing the process is not the same as getting the call back. Run waits
-	// for the goroutine copying into these buffers, and that goroutine finishes
-	// only when every process holding the pipe's write end has exited — the
-	// context kills the direct child, not a grandchild it left behind. Without a
-	// delay a credential helper, a hook, or anything wedged on a stalled mount
-	// holds this call open past the timeout and freezes the refresh loop the
-	// timeout exists to protect.
-	cmd.WaitDelay = time.Second
-
-	if err := cmd.Run(); err != nil && !answeredBeforeItsChildLetGo(cmd, err) {
-		var notFound *exec.Error
-		if errors.As(err, &notFound) {
-			return nil, musem.Wrap(err, musem.EUNAVAILABLE,
-				"the Claude CLI (%s) was not found on PATH", bin)
-		}
-		if ctx.Err() != nil {
-			return nil, musem.Wrap(ctx.Err(), musem.EUNAVAILABLE,
-				"discovery timed out after %s", timeout)
+	res, err := execx.Run(ctx, execx.Cmd{
+		Bin:     bin,
+		Args:    []string{"agents", "--json"},
+		Timeout: timeout,
+		// Nothing is assumed about the payload: output the closing pipe cut
+		// short is not valid JSON, so it fails in the parser as unparseable —
+		// the accurate complaint, and a different one from the CLI failing.
+		Answered: func(string) bool { return true },
+	})
+	if err != nil {
+		var xerr *execx.Error
+		if errors.As(err, &xerr) {
+			switch xerr.Kind {
+			case execx.NotFound:
+				return musem.Discovery{}, musem.Wrap(err, musem.EUNAVAILABLE,
+					"the Claude CLI (%s) was not found on PATH", bin)
+			case execx.Timeout:
+				return musem.Discovery{}, musem.Wrap(err, musem.EUNAVAILABLE,
+					"discovery timed out after %s", timeout)
+			case execx.Exited, execx.Failed:
+			}
 		}
 		// The CLI's own explanation is worth more than a generic failure: an
 		// unsupported flag after an upgrade, a config problem, a pending auth
 		// prompt. It was already captured; throwing it away leaves the user an
 		// error they cannot act on.
-		if detail := firstLine(stderr.String()); detail != "" {
-			return nil, musem.Wrap(err, musem.EUNAVAILABLE,
+		if detail := firstLine(res.Stderr); detail != "" {
+			return musem.Discovery{}, musem.Wrap(err, musem.EUNAVAILABLE,
 				"the Claude CLI failed to list sessions: %s", detail)
 		}
-		return nil, musem.Wrap(err, musem.EUNAVAILABLE,
+		return musem.Discovery{}, musem.Wrap(err, musem.EUNAVAILABLE,
 			"the Claude CLI failed to list sessions")
 	}
 
-	return parseAgents(stdout.Bytes())
-}
-
-// answeredBeforeItsChildLetGo reports that the CLI did the job and only the
-// plumbing outlived it.
-//
-// WaitDelay closes the pipes when the process holding their write end is not the
-// one that was waited on — a hook, a helper, anything the CLI forks and detaches
-// — and Run then reports ErrWaitDelay for a command that exited zero. Taking
-// that as a failure throws away a session list that was captured in full and
-// puts an error banner over stale rows, every refresh, for a call that worked.
-//
-// Nothing is assumed about the payload. Output the closing pipe cut short is not
-// valid JSON, so it fails in the parser as unparseable — which is the accurate
-// complaint, and a different one from the CLI having failed.
-func answeredBeforeItsChildLetGo(cmd *exec.Cmd, err error) bool {
-	return errors.Is(err, exec.ErrWaitDelay) &&
-		cmd.ProcessState != nil && cmd.ProcessState.Success()
+	return parseAgents([]byte(res.Stdout))
 }
 
 // firstLine returns the first non-empty line of s, bounded so a CLI that writes
@@ -150,33 +119,41 @@ func firstLine(s string) string {
 // parseAgents maps the CLI payload onto musem sessions. It is separate from the
 // process call so the mapping can be tested against fixtures without running
 // anything.
-func parseAgents(data []byte) ([]musem.Session, error) {
+func parseAgents(data []byte) (musem.Discovery, error) {
 	// Decoded one record at a time. The payload belongs to another tool and can
 	// change shape without warning; a single record musem cannot read must cost
 	// the user that session, not every session — the same degradation the
 	// transcript reader applies line by line.
 	var raw []json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, musem.Wrap(err, musem.EUNPARSEABLE,
+		return musem.Discovery{}, musem.Wrap(err, musem.EUNPARSEABLE,
 			"the session list was not in a recognised format")
 	}
 
 	now := time.Now()
-	sessions := make([]musem.Session, 0, len(raw))
+	out := musem.Discovery{Sessions: make([]musem.Session, 0, len(raw))}
 	for _, item := range raw {
 		var r agentRecord
 		if err := json.Unmarshal(item, &r); err != nil {
+			// Counted, not merely skipped. A pass that could read none of what
+			// it found looks exactly like a pass that found nothing, and the
+			// registry treats an empty inventory as every session having ended
+			// — so a field changing type across the board would mark the whole
+			// fleet dead, confidently and with no marker. The count is what
+			// keeps that from being silent.
+			out.Skipped++
 			continue
 		}
 		if r.SessionID == "" {
 			// Without a stable identifier there is nothing to key on, and
 			// inventing one would silently create a duplicate on every refresh.
+			out.Skipped++
 			continue
 		}
 		s := musem.Session{
 			ID:       r.SessionID,
-			Name:     r.Name,
-			Dir:      r.CWD,
+			Name:     sanitise(r.Name),
+			Dir:      sanitise(r.CWD),
 			Status:   mapStatus(r.Status),
 			PID:      r.PID,
 			LastSeen: now,
@@ -184,9 +161,9 @@ func parseAgents(data []byte) ([]musem.Session, error) {
 		if r.StartedAt > 0 {
 			s.Started = time.UnixMilli(r.StartedAt)
 		}
-		sessions = append(sessions, s)
+		out.Sessions = append(out.Sessions, s)
 	}
-	return sessions, nil
+	return out, nil
 }
 
 // mapStatus translates the CLI's status vocabulary into musem's.

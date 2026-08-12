@@ -15,7 +15,7 @@ import (
 func TestStatusValid(t *testing.T) {
 	for _, s := range []musem.Status{
 		musem.StatusRunning, musem.StatusWaiting, musem.StatusIdle,
-		musem.StatusDead, musem.StatusIndeterminate,
+		musem.StatusDead, musem.StatusEnded, musem.StatusIndeterminate,
 	} {
 		if !s.Valid() {
 			t.Errorf("%q should be valid", s)
@@ -39,6 +39,9 @@ func TestStatusUrgencyOrder(t *testing.T) {
 		musem.StatusRunning,
 		musem.StatusIndeterminate,
 		musem.StatusIdle,
+		// Below every live status: something that has finished is not competing
+		// for attention with something that has not.
+		musem.StatusEnded,
 	}
 
 	for i := 1; i < len(ordered); i++ {
@@ -50,8 +53,8 @@ func TestStatusUrgencyOrder(t *testing.T) {
 
 	// An unrecognised status sorts below every known one rather than landing in
 	// the middle of them, where it would displace a session that is waiting.
-	if got, want := musem.Status("nonsense").Urgency(), musem.StatusIdle.Urgency(); got <= want {
-		t.Errorf("unknown status urgency = %d, want greater than idle's %d", got, want)
+	if got, want := musem.Status("nonsense").Urgency(), musem.StatusEnded.Urgency(); got <= want {
+		t.Errorf("unknown status urgency = %d, want greater than ended's %d", got, want)
 	}
 }
 

@@ -29,6 +29,11 @@ type Discoverer struct {
 	// Err, when set, is returned instead of the sessions, which is how the
 	// unavailable-source path gets exercised.
 	Err error
+
+	// Skipped, when set, is reported alongside the sessions, which is how the
+	// partially-readable path gets exercised — a pass that succeeded and still
+	// could not read everything it found.
+	Skipped int
 }
 
 // NewDiscoverer returns a Discoverer preloaded with a representative spread of
@@ -76,17 +81,20 @@ func NewDiscoverer() *Discoverer {
 }
 
 // Discover returns the configured sessions, or the configured error.
-func (d *Discoverer) Discover(_ context.Context) ([]musem.Session, error) {
+func (d *Discoverer) Discover(_ context.Context) (musem.Discovery, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	if d.Err != nil {
-		return nil, d.Err
+		return musem.Discovery{}, d.Err
 	}
 
 	out := make([]musem.Session, len(d.sessions))
 	copy(out, d.sessions)
-	return out, nil
+	// Skipped stays zero: a fabricated source reads everything it invents. The
+	// degraded path is reached by setting Skipped explicitly, the same way the
+	// unavailable path is reached by setting Err.
+	return musem.Discovery{Sessions: out, Skipped: d.Skipped}, nil
 }
 
 // SetSessions replaces the served set, so a test can drive a transition such as

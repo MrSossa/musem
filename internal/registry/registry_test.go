@@ -14,13 +14,14 @@ import (
 
 type fakeDiscoverer struct {
 	sessions []musem.Session
+	skipped  int
 	err      error
 	calls    int
 }
 
-func (f *fakeDiscoverer) Discover(context.Context) ([]musem.Session, error) {
+func (f *fakeDiscoverer) Discover(context.Context) (musem.Discovery, error) {
 	f.calls++
-	return f.sessions, f.err
+	return musem.Discovery{Sessions: f.sessions, Skipped: f.skipped}, f.err
 }
 
 type fakeBranches struct{ byDir map[string]string }
@@ -141,6 +142,112 @@ func TestDisappearedSessionIsMarkedNotDropped(t *testing.T) {
 	}
 	if beta.EndedAt.IsZero() {
 		t.Error("EndedAt must record when it was last seen")
+	}
+	// Ended, not dead. Dead reads as "this one failed, go look", and a word that
+	// lands on every session the user closes cleanly stops carrying that meaning
+	// the one time it should.
+	if beta.Status != musem.StatusEnded {
+		t.Errorf("status = %q, want %q: disappearing is how a session finishes normally",
+			beta.Status, musem.StatusEnded)
+	}
+}
+
+// A source that calls a session dead has observed something this registry has
+// not. Overwriting that with "ended" would discard the one verdict worth acting
+// on, so an adapter-reported death survives the session going away.
+func TestAnAdapterReportedDeathIsNotSoftenedToEnded(t *testing.T) {
+	d := &fakeDiscoverer{sessions: []musem.Session{session("a", "alpha", "/p/alpha", musem.StatusDead)}}
+	r := New(d, fakeBranches{})
+	r.Refresh(context.Background())
+
+	d.sessions = nil
+	r.Refresh(context.Background())
+
+	snap := r.Snapshot()
+	if len(snap.Sessions) != 1 {
+		t.Fatalf("got %d sessions, want 1", len(snap.Sessions))
+	}
+	if got := snap.Sessions[0]; got.Status != musem.StatusDead || !got.Ended() {
+		t.Errorf("status = %q, ended = %v; want the reported death kept and the session marked ended",
+			got.Status, got.Ended())
+	}
+}
+
+// How long a session has held its status is what makes the status actionable:
+// waiting for four seconds is the loop working, waiting for ten minutes is a
+// person blocked. LastSeen cannot answer it — it is restamped every pass.
+func TestStatusSinceSurvivesRefreshesAndResetsOnChange(t *testing.T) {
+	now := time.Now()
+	clock := func() time.Time { return now }
+
+	d := &fakeDiscoverer{sessions: []musem.Session{session("a", "alpha", "/p/alpha", musem.StatusWaiting)}}
+	r := New(d, fakeBranches{}, WithClock(func() time.Time { return clock() }))
+
+	r.Refresh(context.Background())
+	first := r.Snapshot().Sessions[0].StatusSince
+	if first.IsZero() {
+		t.Fatal("StatusSince must be stamped when a session is first folded in")
+	}
+
+	// Same status, later pass: the moment it began must not move.
+	now = now.Add(30 * time.Second)
+	r.Refresh(context.Background())
+	again := r.Snapshot().Sessions[0]
+	if !again.StatusSince.Equal(first) {
+		t.Errorf("StatusSince moved from %v to %v on a pass that changed nothing", first, again.StatusSince)
+	}
+	if !again.LastSeen.After(first) {
+		t.Error("LastSeen must keep advancing; it is the age of the pass, not of the state")
+	}
+
+	// Different status: the clock restarts, because the old age describes a
+	// state the session is no longer in.
+	now = now.Add(30 * time.Second)
+	d.sessions = []musem.Session{session("a", "alpha", "/p/alpha", musem.StatusIdle)}
+	r.Refresh(context.Background())
+	if got := r.Snapshot().Sessions[0].StatusSince; !got.Equal(now) {
+		t.Errorf("StatusSince = %v, want %v: a new status starts its own clock", got, now)
+	}
+}
+
+// A pass that read none of the records it found looks exactly like a pass over a
+// machine with nothing running — and the registry answers the second by marking
+// every session ended. The count is what separates them.
+func TestUnreadableRecordsAreReportedRatherThanReadAsAnEmptyMachine(t *testing.T) {
+	d := &fakeDiscoverer{sessions: []musem.Session{session("a", "alpha", "/p/alpha", musem.StatusRunning)}}
+	r := New(d, fakeBranches{})
+	r.Refresh(context.Background())
+
+	d.sessions, d.skipped = nil, 2
+	r.Refresh(context.Background())
+
+	snap := r.Snapshot()
+	if snap.Skipped != 2 {
+		t.Errorf("Skipped = %d, want 2 carried through to the snapshot", snap.Skipped)
+	}
+	// The pass itself succeeded, so the data is current and no error is due. What
+	// it is, is incomplete — which is a different thing to say and needs its own
+	// channel to say it in.
+	if snap.Stale || snap.ErrCode != "" {
+		t.Errorf("stale = %v, code = %q; a successful pass that dropped records is neither stale nor failed",
+			snap.Stale, snap.ErrCode)
+	}
+}
+
+// The count describes the last pass, not the run. A source that recovers must
+// stop being reported as incomplete, or the warning outlives the problem and
+// stops meaning anything.
+func TestTheSkippedCountDescribesTheLatestPass(t *testing.T) {
+	d := &fakeDiscoverer{skipped: 3}
+	r := New(d, fakeBranches{})
+	r.Refresh(context.Background())
+
+	d.skipped = 0
+	d.sessions = []musem.Session{session("a", "alpha", "/p/alpha", musem.StatusIdle)}
+	r.Refresh(context.Background())
+
+	if got := r.Snapshot().Skipped; got != 0 {
+		t.Errorf("Skipped = %d, want 0 once the source is readable again", got)
 	}
 }
 
@@ -310,15 +417,8 @@ func TestRunDoesNotOverlapQueries(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 
-	out := make(chan Snapshot, 64)
 	done := make(chan struct{})
-	go func() { r.Run(ctx, out); close(done) }()
-
-	// Drain so Run is never blocked on the channel.
-	go func() {
-		for range out {
-		}
-	}()
+	go func() { r.Run(ctx); close(done) }()
 
 	<-done
 	if overlapped {
@@ -368,10 +468,10 @@ type slowDiscoverer struct {
 	calls  int
 }
 
-func (s *slowDiscoverer) Discover(context.Context) ([]musem.Session, error) {
+func (s *slowDiscoverer) Discover(context.Context) (musem.Discovery, error) {
 	s.calls++
 	s.onCall()
-	return nil, errors.New("no sessions")
+	return musem.Discovery{}, errors.New("no sessions")
 }
 
 // countingBranches records how often it is asked, so the cache can be shown to

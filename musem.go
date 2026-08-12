@@ -27,8 +27,17 @@ const (
 	StatusWaiting Status = "waiting"
 	// StatusIdle means the session is ready for instructions.
 	StatusIdle Status = "idle"
-	// StatusDead means the session terminated abnormally.
+	// StatusDead means the session terminated abnormally. It is reported by the
+	// source, never inferred: a session simply going away is StatusEnded.
 	StatusDead Status = "dead"
+	// StatusEnded means the session stopped appearing in discovery without the
+	// source calling it a failure — the ordinary way a session finishes.
+	//
+	// Kept apart from StatusDead because they read differently and only one is
+	// worth investigating. Every session a user closes cleanly would otherwise
+	// be labelled dead, and a word that appears on every finished session stops
+	// meaning anything on the one that genuinely crashed.
+	StatusEnded Status = "ended"
 	// StatusIndeterminate means the available signals do not allow deciding.
 	//
 	// This exists so musem never has to guess. A false "idle" is worse than an
@@ -40,7 +49,7 @@ const (
 // Valid reports whether s is one of the known statuses.
 func (s Status) Valid() bool {
 	switch s {
-	case StatusRunning, StatusWaiting, StatusIdle, StatusDead, StatusIndeterminate:
+	case StatusRunning, StatusWaiting, StatusIdle, StatusDead, StatusEnded, StatusIndeterminate:
 		return true
 	}
 	return false
@@ -61,8 +70,12 @@ func (s Status) Urgency() int {
 		return 3
 	case StatusIdle:
 		return 4
+	case StatusEnded:
+		// Below every live status: a session that has finished is not competing
+		// for attention with one that has not.
+		return 5
 	}
-	return 5
+	return 6
 }
 
 // Session is an agent session observed on this machine.
@@ -85,6 +98,20 @@ type Session struct {
 	PID     int
 	Started time.Time
 
+	// StatusSince is when the session entered Status, as observed by musem.
+	//
+	// It answers "since when?", which is the question that makes a status
+	// actionable: waiting for four seconds is the loop working, waiting for ten
+	// minutes is a person being blocked, and indeterminate for an hour means the
+	// signal is not coming back. LastSeen cannot serve — it is restamped on
+	// every refresh, so it reports the age of the pass rather than the age of
+	// the state.
+	//
+	// It is observed rather than authoritative: musem stamps it the first time
+	// it sees the session in that status, so a session already waiting when
+	// musem starts dates from then, not from when it truly began waiting.
+	StatusSince time.Time
+
 	// LastSeen is when discovery last observed this session.
 	LastSeen time.Time
 
@@ -95,6 +122,22 @@ type Session struct {
 
 // Ended reports whether the session has stopped appearing in discovery.
 func (s *Session) Ended() bool { return s.EndedAt != nil }
+
+// Discovery is the result of one pass over the source of live sessions.
+//
+// It carries a skipped count for the same reason UsageReading does: a pass that
+// could read none of what it found is not a pass that found nothing, and the two
+// are indistinguishable from the session list alone. Without the count, a
+// foreign format change empties the inventory silently and every live session
+// reads as one that has ended.
+type Discovery struct {
+	// Sessions is what the pass could read.
+	Sessions []Session
+
+	// Skipped counts records passed over because they could not be understood.
+	// Non-zero means the inventory beside it is incomplete and must say so.
+	Skipped int
+}
 
 // Validate returns an error if the session is missing what every session must
 // have. Adapters call this after mapping foreign data; they do not reimplement

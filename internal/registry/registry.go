@@ -21,7 +21,7 @@ import (
 // Declared here, by the consumer, rather than in the package that implements
 // it: registry states what it needs and stays ignorant of who provides it.
 type Discoverer interface {
-	Discover(ctx context.Context) ([]musem.Session, error)
+	Discover(ctx context.Context) (musem.Discovery, error)
 }
 
 // BranchResolver reports the git branch checked out in a directory. An empty
@@ -85,6 +85,15 @@ type Snapshot struct {
 	// presentation and the adapter never has to.
 	ErrCode    string
 	ErrMessage string
+
+	// Skipped is how many records the last successful pass could not read.
+	//
+	// It is distinct from ErrCode on purpose: the call worked, so the inventory
+	// beside it is real — but it is missing however many sessions this counts,
+	// and every one of them will look to the rest of the registry like a
+	// session that has ended. A refresh that reads nothing is not a refresh
+	// that found nothing, and this is what lets the interface tell them apart.
+	Skipped int
 }
 
 // Registry keeps the known sessions up to date.
@@ -104,6 +113,7 @@ type Registry struct {
 	branchByDir map[string]branchEntry
 	updatedAt   time.Time
 	lastErr     error
+	skipped     int
 }
 
 // branchEntry is a resolved branch and when it was resolved, so it can be
@@ -174,22 +184,20 @@ func New(d Discoverer, b BranchResolver, opts ...Option) *Registry {
 	return r
 }
 
-// Run refreshes on an interval until ctx is cancelled, sending a Snapshot after
-// every attempt.
+// Run refreshes on an interval until ctx is cancelled.
+//
+// It publishes nothing: readers pull with Snapshot, which is what the composer
+// does on every frame. A push channel used to live here and had exactly one
+// consumer, whose whole job was to discard what it received — and because Run
+// blocked on the send, that discard was load-bearing for a value nobody wanted.
 //
 // The next wait starts only after a refresh returns, so two discovery calls can
 // never overlap — the property is structural rather than something a guard has
 // to enforce. A slow source therefore stretches the interval instead of piling
 // up work behind it.
-func (r *Registry) Run(ctx context.Context, out chan<- Snapshot) {
+func (r *Registry) Run(ctx context.Context) {
 	for {
 		r.Refresh(ctx)
-
-		select {
-		case out <- r.Snapshot():
-		case <-ctx.Done():
-			return
-		}
 
 		select {
 		case <-ctx.Done():
@@ -204,13 +212,14 @@ func (r *Registry) Run(ctx context.Context, out chan<- Snapshot) {
 // A failure is recorded but does not clear the inventory: the last known data
 // is more useful than an empty screen, provided the UI is told it is old.
 func (r *Registry) Refresh(ctx context.Context) {
-	found, err := r.discoverer.Discover(ctx)
+	discovery, err := r.discoverer.Discover(ctx)
 	if err != nil {
 		r.mu.Lock()
 		r.lastErr = err
 		r.mu.Unlock()
 		return
 	}
+	found := discovery.Sessions
 
 	// Branches are resolved before the lock is taken. Resolution shells out to
 	// git, and holding the write lock across that would block every reader for
@@ -222,6 +231,7 @@ func (r *Registry) Refresh(ctx context.Context) {
 	defer r.mu.Unlock()
 
 	r.lastErr = nil
+	r.skipped = discovery.Skipped
 
 	now := r.now()
 	seen := make(map[string]bool, len(found))
@@ -235,6 +245,10 @@ func (r *Registry) Refresh(ctx context.Context) {
 		seen[s.ID] = true
 		s.LastSeen = now
 		s.Branch = branches[s.Dir]
+		// Stamped here rather than by the adapter: how long a session has held a
+		// status is a fact about musem's observation of it, and the adapter
+		// reports one instant with no memory of the last.
+		s.StatusSince = now
 
 		if prev, ok := r.sessions[s.ID]; ok {
 			// A session that reappears keeps the identity it had — a rename
@@ -246,6 +260,13 @@ func (r *Registry) Refresh(ctx context.Context) {
 			// one.
 			if s.Started.IsZero() {
 				s.Started = prev.Started
+			}
+			// A status that did not change keeps the moment it began. Restamping
+			// it every pass is what LastSeen already does, and it would report
+			// the age of the refresh in place of the age of the state — which is
+			// the whole distinction "waiting since when" rests on.
+			if prev.Status == s.Status && !prev.StatusSince.IsZero() {
+				s.StatusSince = prev.StatusSince
 			}
 		}
 		r.sessions[s.ID] = s
@@ -262,7 +283,13 @@ func (r *Registry) Refresh(ctx context.Context) {
 			endedAt = now
 		}
 		s.EndedAt = &endedAt
-		s.Status = musem.StatusDead
+		// Ended, not dead. Disappearing from discovery is how a session finishes
+		// normally; dead is a verdict the source has to pronounce, and inferring
+		// it here would label every cleanly closed session a failure.
+		if s.Status != musem.StatusDead {
+			s.Status = musem.StatusEnded
+			s.StatusSince = now
+		}
 		r.sessions[id] = s
 	}
 
@@ -371,7 +398,7 @@ func (r *Registry) Snapshot() Snapshot {
 		return a.ID < b.ID
 	})
 
-	snap := Snapshot{Sessions: sessions, UpdatedAt: r.updatedAt}
+	snap := Snapshot{Sessions: sessions, UpdatedAt: r.updatedAt, Skipped: r.skipped}
 
 	if r.lastErr != nil {
 		snap.ErrCode = musem.ErrorCode(r.lastErr)

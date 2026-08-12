@@ -56,11 +56,12 @@ SHALL NOT be used as a key.
 **Capability**: `session-registry`
 
 The system SHALL expose one status per session among: running (the agent is
-working), waiting (it needs a user action), idle (ready for instructions) and
-dead (it terminated abnormally). Status SHALL be derived from structured data
-published by the tool. When a status can only be obtained by scraping rendered
-text, the system SHALL expose it as indeterminate rather than risk a wrong
-verdict.
+working), waiting (it needs a user action), idle (ready for instructions), dead
+(it terminated abnormally) and ended (it stopped appearing without the source
+reporting a failure). Status SHALL be derived from structured data published by
+the tool. When a status can only be obtained by scraping rendered text, the
+system SHALL expose it as indeterminate rather than risk a wrong verdict. The
+system SHALL also expose how long each session has held its current status.
 
 #### Scenario: Waiting is distinct from idle
 
@@ -73,6 +74,20 @@ verdict.
 - **GIVEN** a session whose only available signal is rendered text
 - **WHEN** the available signals do not allow deciding the status confidently
 - **THEN** the status is exposed as indeterminate, along with since when
+
+#### Scenario: Finishing is distinct from failing
+
+- **GIVEN** a session the source has never reported as failed
+- **WHEN** it stops appearing in discovery
+- **THEN** its status is "ended" rather than "dead", and a death the source did
+  report is preserved as such
+
+#### Scenario: The age of a status outlives the refresh that observed it
+
+- **GIVEN** a session that has held the same status across several refreshes
+- **WHEN** the user inspects it
+- **THEN** the age reported is how long the status has held, not how long ago
+  the last refresh ran
 
 ### R4 · Session git branch
 
@@ -130,6 +145,36 @@ if it were current.
 - **WHEN** it returns fields musem cannot interpret
 - **THEN** what is understood is preserved, the rest is marked unknown, and the
   fact is logged once rather than repeatedly
+
+### R19 · Foreign text carries no terminal instructions
+
+**Capability**: `session-registry`
+
+Text the system did not author — session names, working directories, model
+identifiers — SHALL be stripped of control characters before it reaches the
+interface. The system SHALL NOT render a value from a foreign source in a way
+that lets that source drive the terminal.
+
+#### Scenario: A crafted name
+
+- **GIVEN** a session whose name or working directory contains escape sequences
+- **WHEN** the dashboard draws it
+- **THEN** the sequences are gone and the readable part of the value survives
+
+### R20 · An unreadable record is reported, not silently dropped
+
+**Capability**: `session-registry`
+
+When a discovery pass succeeds but cannot interpret some of the records it
+found, the system SHALL report how many it dropped. A pass that could read none
+of its records SHALL NOT be presented as a pass that found no sessions.
+
+#### Scenario: Every record becomes unreadable
+
+- **GIVEN** live sessions on the machine and a source whose record shape changed
+- **WHEN** a discovery pass reads none of them
+- **THEN** the count of dropped records is reported, rather than an empty
+  inventory in which every known session reads as having ended
 
 ### R7 · Usage derived from structured data
 
@@ -287,7 +332,11 @@ value with the same appearance as a current one.
 
 Within this scope the dashboard SHALL limit itself to observing. It SHALL NOT
 send input to a session, create, stop or restart one, nor modify a session's
-state or the filesystem in any way.
+state, a repository, or any file outside musem's own history store.
+
+The store is the one exception, and a narrow one: R11 requires history to
+survive a restart, which cannot be done without writing somewhere. Everything
+the user is observing stays untouched.
 
 #### Scenario: No destructive actions available
 

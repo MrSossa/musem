@@ -21,7 +21,9 @@ The root package holds the domain (`musem.Session`, `musem.Status`) plus
 `error.go` with application error codes, and imports nothing outside the standard
 library. Everything else lives under `internal/`: adapters are named after what
 they wrap (`claude`, `sqlite`, `git`, `inmem`), orchestration gets capability
-packages (`registry`, `cost`), `app` composes them and `tui` renders.
+packages (`registry`, `cost`), `app` composes them and `tui` renders. `execx`
+wraps `os/exec` for the adapters that shell out and stays a leaf: it imports
+nothing from musem, which a test enforces.
 
 Consumers declare the interfaces they need — no ports package. Dependencies point
 inward, `main.go` is the only place that wires the graph, and there is no

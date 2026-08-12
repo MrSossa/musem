@@ -27,6 +27,10 @@ var adapters = []string{"claude", "sqlite", "git", "inmem"}
 // discovery loop, staleness tracking, cost aggregation across sources.
 var orchestration = []string{"registry", "cost"}
 
+// helpers wrap a piece of the standard library that is easy to get wrong, and
+// nothing else. They know no musem type and no musem package.
+var helpers = []string{"execx"}
+
 // TestRootPackageImportsNothingExternal is the load-bearing rule. The domain
 // sits at the centre precisely because it depends on nobody; the moment it
 // imports an adapter or a driver, every other boundary becomes decorative.
@@ -99,17 +103,72 @@ func TestAdaptersDoNotImportOrchestration(t *testing.T) {
 	}
 }
 
-// TestTUIDoesNotImportAdapters keeps presentation off the data sources. The UI
-// receives messages; it does not go looking for data.
-func TestTUIDoesNotImportAdapters(t *testing.T) {
+// TestTUIFetchesNothing keeps presentation off the data sources entirely.
+//
+// Adapters are the obvious half. Orchestration is the half worth stating: tui
+// reaching into registry or cost directly would go around app, which is where
+// composing a session with its cost belongs precisely so a second front end does
+// not have to repeat it. That shortcut compiles, reads as a convenience, and
+// quietly moves the join into the view — so it is asserted rather than trusted.
+func TestTUIFetchesNothing(t *testing.T) {
 	pkg, ok := importDir(t, filepath.Join("..", "tui"))
 	if !ok {
 		t.Skip("tui not implemented yet")
 	}
 
 	for _, imp := range pkg.Imports {
-		if adapter, ok := internalPackage(imp); ok && contains(adapters, adapter) {
+		other, ok := internalPackage(imp)
+		if !ok {
+			continue
+		}
+		if contains(adapters, other) {
 			t.Errorf("tui imports adapter %q; the UI renders what it is handed and fetches nothing", imp)
+		}
+		if contains(orchestration, other) {
+			t.Errorf("tui imports orchestration package %q; the UI reads composed snapshots from app, which is what keeps the join out of the view", imp)
+		}
+	}
+}
+
+// TestComposerDoesNotImportAdapters puts app under the same rule as the
+// orchestration it composes.
+//
+// app sits on the inward-pointing arrow — cmd, then tui and app, then
+// orchestration, then adapters — and was the one link in it nothing asserted. A
+// composer reaching for sqlite to special-case a persistence detail is the
+// plausible way that arrow bends, and it would bend silently.
+func TestComposerDoesNotImportAdapters(t *testing.T) {
+	pkg, ok := importDir(t, filepath.Join("..", "app"))
+	if !ok {
+		t.Skip("app not implemented yet")
+	}
+
+	for _, imp := range pkg.Imports {
+		if adapter, ok := internalPackage(imp); ok && contains(adapters, adapter) {
+			t.Errorf("app imports adapter %q; it composes what orchestration reports and knows no implementations", imp)
+		}
+	}
+}
+
+// TestSharedHelpersStayLeaves keeps a package shared by several adapters from
+// becoming a place where they meet.
+//
+// execx exists so the subtlety of bounding a subprocess is solved once rather
+// than copied. That is only worth having while it stays ignorant: the moment it
+// imports musem's domain or one of its callers, it stops being a helper and
+// becomes a second composition root that every adapter depends on.
+func TestSharedHelpersStayLeaves(t *testing.T) {
+	for _, name := range helpers {
+		pkg, ok := importDir(t, filepath.Join("..", name))
+		if !ok {
+			continue
+		}
+
+		for _, imp := range pkg.Imports {
+			if isStdlib(imp) {
+				continue
+			}
+			t.Errorf("%s imports %q; a shared helper stays a leaf, or it turns into a hub every adapter depends on", name, imp)
 		}
 	}
 }

@@ -102,9 +102,7 @@ func run(fake bool, interval time.Duration) error {
 	program := tea.NewProgram(tui.NewModel(), tea.WithAltScreen(), tea.WithContext(ctx))
 
 	// One goroutine per source, each feeding the single pump.
-	snapshots := make(chan registry.Snapshot, 1)
-	go reg.Run(ctx, snapshots)
-	go drain(ctx, snapshots)
+	go reg.Run(ctx)
 
 	quit := make(chan struct{})
 	pumped := make(chan struct{})
@@ -156,18 +154,4 @@ func shutdownError(err, ctxErr error) error {
 		return nil
 	}
 	return err
-}
-
-// drain consumes the registry's own snapshot channel. The registry publishes
-// there so a second consumer could be added without touching it; musem reads
-// composed snapshots through the pump instead, so this keeps the loop from
-// blocking on a channel nobody is listening to.
-func drain(ctx context.Context, ch <-chan registry.Snapshot) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ch:
-		}
-	}
 }

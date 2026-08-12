@@ -65,6 +65,12 @@ type Snapshot struct {
 	StaleFor   time.Duration
 	ErrCode    string
 	ErrMessage string
+
+	// Undiscovered is how many session records the last successful pass could
+	// not read. Distinct from Stale: the data here is current, and incomplete by
+	// exactly this many sessions — each of which is missing from the rows rather
+	// than shown wrongly in them.
+	Undiscovered int
 }
 
 // Composer assembles snapshots.
@@ -158,12 +164,13 @@ func (c *Composer) Snapshot() Snapshot {
 	// figure summed over all of it under a count of the few on screen would
 	// belong to neither.
 	return Snapshot{
-		Rows:       rows,
-		Fleet:      c.accountant.Total(ids),
-		Stale:      inventory.Stale,
-		StaleFor:   inventory.Age,
-		ErrCode:    inventory.ErrCode,
-		ErrMessage: inventory.ErrMessage,
+		Rows:         rows,
+		Fleet:        c.accountant.Total(ids),
+		Stale:        inventory.Stale,
+		StaleFor:     inventory.Age,
+		ErrCode:      inventory.ErrCode,
+		ErrMessage:   inventory.ErrMessage,
+		Undiscovered: inventory.Skipped,
 	}
 }
 

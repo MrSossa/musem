@@ -24,7 +24,8 @@ func TestParseAgents(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sessions, err := parseAgents(data)
+	discovery, err := parseAgents(data)
+	sessions := discovery.Sessions
 	if err != nil {
 		t.Fatalf("parseAgents: %v", err)
 	}
@@ -64,7 +65,8 @@ func TestParseAgentsKeepsSessionsSharingADirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sessions, err := parseAgents(data)
+	discovery, err := parseAgents(data)
+	sessions := discovery.Sessions
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +90,8 @@ func TestParseAgentsToleratesUnknownShape(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sessions, err := parseAgents(data)
+	discovery, err := parseAgents(data)
+	sessions := discovery.Sessions
 	if err != nil {
 		t.Fatalf("unknown fields must not fail the parse: %v", err)
 	}
@@ -622,7 +625,8 @@ func TestOneUnreadableAgentRecordDoesNotDiscardTheRest(t *testing.T) {
 		{"sessionId":"c","name":"docs","cwd":"/p/docs","status":"idle","pid":3,"startedAt":1700000000000}
 	]`)
 
-	sessions, err := parseAgents(payload)
+	discovery, err := parseAgents(payload)
+	sessions := discovery.Sessions
 	if err != nil {
 		t.Fatalf("one unreadable record failed the whole list: %v", err)
 	}
@@ -639,6 +643,46 @@ func TestOneUnreadableAgentRecordDoesNotDiscardTheRest(t *testing.T) {
 		if !found {
 			t.Errorf("session %q was discarded along with the record that could not be read", want)
 		}
+	}
+	if discovery.Skipped != 1 {
+		t.Errorf("Skipped = %d, want 1: a record that was dropped has to be counted", discovery.Skipped)
+	}
+}
+
+// The failure this exists to prevent: a field changing type across every record
+// empties the list, and an empty list is indistinguishable from a machine with
+// no sessions on it. The registry reads that as every session having ended and
+// marks the lot, confidently and with nothing on screen to say otherwise.
+func TestAPassThatCouldReadNothingSaysSoRatherThanReportingNoSessions(t *testing.T) {
+	// Every record's startedAt has become a string, as a CLI release might leave
+	// them all at once.
+	payload := []byte(`[
+		{"sessionId":"a","name":"api","status":"running","startedAt":"2026-01-01T00:00:00Z"},
+		{"sessionId":"b","name":"web","status":"idle","startedAt":"2026-01-01T00:00:00Z"}
+	]`)
+
+	discovery, err := parseAgents(payload)
+	if err != nil {
+		t.Fatalf("the list itself parsed; only its records did not: %v", err)
+	}
+	if len(discovery.Sessions) != 0 {
+		t.Fatalf("got %d sessions, want none readable", len(discovery.Sessions))
+	}
+	if discovery.Skipped != 2 {
+		t.Errorf("Skipped = %d, want 2; without the count this is indistinguishable from a machine running no sessions at all", discovery.Skipped)
+	}
+}
+
+// A record with no session id is dropped for a different reason than one that
+// would not decode, and is counted for the same reason: it is a session the user
+// has that musem is not showing.
+func TestARecordWithoutAnIdentifierIsCounted(t *testing.T) {
+	discovery, err := parseAgents([]byte(`[{"name":"api","status":"running"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discovery.Sessions) != 0 || discovery.Skipped != 1 {
+		t.Errorf("sessions = %d, skipped = %d; want 0 and 1", len(discovery.Sessions), discovery.Skipped)
 	}
 }
 
@@ -868,10 +912,11 @@ func TestSessionsSurviveAChildThatOutlivesTheCLI(t *testing.T) {
 	}
 
 	d := &Discoverer{Bin: bin, Timeout: 30 * time.Second}
-	sessions, err := d.Discover(context.Background())
+	discovery, err := d.Discover(context.Background())
 	if err != nil {
 		t.Fatalf("err = %v, want nil: the CLI answered, and only its child outlived it", err)
 	}
+	sessions := discovery.Sessions
 	if len(sessions) != 1 || sessions[0].ID != "s1" {
 		t.Errorf("sessions = %+v, want the one the CLI listed", sessions)
 	}

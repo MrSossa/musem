@@ -121,13 +121,34 @@ Scaffolding tasks that advance no single requirement are marked `infra`.
 - [x] 7.13 Verify no operation exists that can alter a session or the repository · R16
   - Verification: manual sweep of every key binding plus the archtest write/network rules
 
-## 8. Wrap-up
+## 8. Review remediation
 
-- [x] 8.1 End-to-end verification with real parallel sessions: status, cost and freshness · R1, R13, R15
+Added after the phase-3 review. Each closes a finding recorded in `review.md`.
+
+- [x] 8.1 Count records a discovery pass could not read and carry the count to the view — `musem.go`, `internal/claude/agents.go`, `internal/registry/registry.go`, `internal/app/app.go`, `internal/tui/tui.go` · R20
+  - Verification: `TestAPassThatCouldReadNothingSaysSoRatherThanReportingNoSessions`, `TestUnreadableRecordsAreReportedRatherThanReadAsAnEmptyMachine`, `TestUnreadRecordsReachTheView`
+- [x] 8.2 Strip control characters from foreign text at the adapter boundary — `internal/claude/sanitise.go`, `internal/claude/transcript.go` · R19
+  - Verification: `TestForeignTextCannotCarryTerminalInstructions`, `TestSanitisePreservesOrdinaryText`
+- [x] 8.3 Record when a session entered its status and report the age in the detail pane — `musem.go`, `internal/registry/registry.go`, `internal/tui/tui.go` · R3
+  - Verification: `TestStatusSinceSurvivesRefreshesAndResetsOnChange`, `TestDetailSaysHowLongTheStatusHasHeld`
+- [x] 8.4 Separate a session that ended from one that died, keeping a source-reported death intact — `musem.go`, `internal/registry/registry.go` · R3
+  - Verification: `TestDisappearedSessionIsMarkedNotDropped`, `TestAnAdapterReportedDeathIsNotSoftenedToEnded`
+- [x] 8.5 Extend the architecture tests to the boundaries the design promised but nothing asserted — `internal/archtest/arch_test.go` · infra
+  - Verification: each new rule was made to fail by injecting the violation it forbids, then restored
+- [x] 8.6 Extract the bounded-subprocess pattern shared by the two shelling adapters — `internal/execx` · infra
+  - Verification: `go test ./internal/execx`, plus `TestSharedHelpersStayLeaves` keeping it a leaf
+- [x] 8.7 Drop the registry's unconsumed push channel and its drain — `internal/registry/registry.go`, `cmd/musem/main.go` · infra
+  - Verification: `TestRunDoesNotOverlapQueries` still holds with the loop pulling only
+- [x] 8.8 Replace the hand-written maxInt/minInt with the language builtins — `internal/tui/tui.go` · infra
+  - Verification: `make lint`, `make test`
+
+## 9. Wrap-up
+
+- [x] 9.1 End-to-end verification with real parallel sessions: status, cost and freshness · R1, R13, R15
   - Verification: manual run against live agent sessions
-- [x] 8.2 Confirm no network request originates from transcript content · R12
+- [x] 9.2 Confirm no network request originates from transcript content · R12
   - Verification: archtest rule that nothing reaches the network
-- [x] 8.3 Document in the README what musem is, what it observes and how to run it — `README.md` · infra
+- [x] 9.3 Document in the README what musem is, what it observes and how to run it — `README.md` · infra
   - Verification: a reader can build and run musem from the README alone
 
 ## Final validation

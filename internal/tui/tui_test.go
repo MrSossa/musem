@@ -664,7 +664,7 @@ func TestEveryStatusFitsItsColumn(t *testing.T) {
 
 	for _, s := range []musem.Status{
 		musem.StatusRunning, musem.StatusWaiting, musem.StatusIdle,
-		musem.StatusDead, musem.StatusIndeterminate,
+		musem.StatusDead, musem.StatusEnded, musem.StatusIndeterminate,
 	} {
 		m := Model{}
 		cell := m.cell(Row{Session: musem.Session{Status: s}}, "STATUS")
@@ -935,5 +935,57 @@ func TestFleetHeaderShowsAFloorWhenTheTotalIsUnknown(t *testing.T) {
 	}
 	if !strings.Contains(view, "(partial)") {
 		t.Error("a floor is still a partial figure and must say so")
+	}
+}
+
+// Sessions dropped before they could be read have no row to be marked in, so
+// the count goes above the table. Without it a source whose record shape changed
+// empties the list, and every session left in the registry reads as one that
+// ended — a screen full of confident, wrong statuses.
+func TestUnreadableSessionRecordsAreAnnounced(t *testing.T) {
+	s := snapshot(row("a", "api", musem.StatusIdle))
+	s.Undiscovered = 2
+
+	view := stripANSI(withSnapshot(NewModel(), s).View())
+	if !strings.Contains(view, "2 session records could not be read") {
+		t.Errorf("the dropped records were not announced:\n%s", view)
+	}
+
+	// And it says nothing when there is nothing to say: a warning that is always
+	// on screen is one nobody reads.
+	s.Undiscovered = 0
+	if view := stripANSI(withSnapshot(NewModel(), s).View()); strings.Contains(view, "could not be read") {
+		t.Errorf("a clean pass must not carry the warning:\n%s", view)
+	}
+}
+
+// A status without its age is half the answer: waiting for four seconds is the
+// loop working, waiting for ten minutes is a person blocked.
+func TestDetailSaysHowLongTheStatusHasHeld(t *testing.T) {
+	now := time.Now()
+	r := row("a", "api", musem.StatusWaiting)
+	r.Session.StatusSince = now.Add(-9 * time.Minute)
+
+	m := Model{clock: func() time.Time { return now }}
+	m = withSnapshot(m, snapshot(r))
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "waiting for 9m") {
+		t.Errorf("the detail pane does not say since when:\n%s", view)
+	}
+}
+
+// A session musem has not yet timed shows the status alone rather than an age
+// computed from a zero timestamp, which would claim it has been waiting since
+// the year one.
+func TestDetailOmitsTheAgeWhenItIsNotKnown(t *testing.T) {
+	m := withSnapshot(NewModel(), snapshot(row("a", "api", musem.StatusWaiting)))
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+
+	if view := stripANSI(m.View()); strings.Contains(view, "waiting for") {
+		t.Errorf("an unknown age must not be rendered:\n%s", view)
 	}
 }

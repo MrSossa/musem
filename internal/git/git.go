@@ -7,14 +7,13 @@
 package git
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/MrSossa/musem"
+	"github.com/MrSossa/musem/internal/execx"
 )
 
 // BranchResolver reports the branch checked out in a directory.
@@ -50,82 +49,53 @@ func (r *BranchResolver) Branch(ctx context.Context, dir string) (string, error)
 		timeout = 5 * time.Second
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	// The directory comes from a discovered session and is genuinely foreign,
+	// but it arrives as one element of an argv — there is no shell to
+	// reinterpret it — and it is passed after "-C", where git reads it as a path
+	// and nothing else. A directory that does not exist, or is not a repository,
+	// is the routine case this function already answers with an empty name.
+	res, err := execx.Run(ctx, execx.Cmd{
+		Bin:     bin,
+		Args:    []string{"-C", dir, "rev-parse", "--abbrev-ref", "HEAD"},
+		Timeout: timeout,
+		// The trailing newline is what separates a complete answer from a pipe
+		// cut mid-word. git terminates the name with one, so output without it
+		// is a fragment — and a fragment shown as a branch is precisely the
+		// confident wrong label this resolver exists to refuse.
+		Answered: func(out string) bool { return strings.HasSuffix(out, "\n") },
+	})
+	if err != nil {
+		var xerr *execx.Error
+		if errors.As(err, &xerr) {
+			switch xerr.Kind {
+			// Distinguish "git is not installed" from "this is not a
+			// repository". The first is worth telling the user about; the
+			// second is routine.
+			case execx.NotFound:
+				return "", musem.Wrap(err, musem.EUNAVAILABLE, "git was not found on PATH")
 
-	var stdout bytes.Buffer
-	// Two variables here, and gosec flags the pair. Neither is a command. The
-	// binary is a field on this struct, defaulted to "git" and set only by the
-	// code that wires the adapter up. The directory comes from a discovered
-	// session and is genuinely foreign, but it arrives as one element of an argv
-	// — there is no shell to reinterpret it — and it is passed after "-C", where
-	// git reads it as a path and nothing else. A directory that does not exist,
-	// or is not a repository, is the routine case this function already answers
-	// with an empty branch name.
-	// #nosec G204 -- bin is a configured field; dir is an argv element after -C, no shell
-	cmd := exec.CommandContext(ctx, bin, "-C", dir, "rev-parse", "--abbrev-ref", "HEAD")
-	cmd.Stdout = &stdout
-	cmd.Stderr = nil
+			// A git that was killed rather than answered says nothing about
+			// dir. Reporting that as "no branch" would be a claim this call
+			// never established, and the caller would cache it in place of a
+			// name it already knew.
+			case execx.Timeout:
+				return "", musem.Wrap(err, musem.EUNAVAILABLE, "git timed out resolving the branch at %s", dir)
 
-	// Killing the process is not the same as getting the call back. Run waits
-	// for the goroutine copying into these buffers, and that goroutine finishes
-	// only when every process holding the pipe's write end has exited — the
-	// context kills the direct child, not a grandchild it left behind. Without a
-	// delay a credential helper, a hook, or anything wedged on a stalled mount
-	// holds this call open past the timeout and freezes the refresh loop the
-	// timeout exists to protect.
-	cmd.WaitDelay = time.Second
+			// git ran and exited non-zero: dir is not a repository, which is a
+			// normal state for a session rather than a failure.
+			case execx.Exited:
+				return "", nil
 
-	if err := cmd.Run(); err != nil && !answeredBeforeItsChildLetGo(cmd, err, stdout.String()) {
-		// Distinguish "git is not installed" from "this is not a repository".
-		// The first is worth telling the user about; the second is routine.
-		var notFound *exec.Error
-		if errors.As(err, &notFound) {
-			return "", musem.Wrap(err, musem.EUNAVAILABLE, "git was not found on PATH")
+			case execx.Failed:
+			}
 		}
-
-		// A git that was killed rather than answered says nothing about dir.
-		// Reporting that as "no branch" would be a claim this call never
-		// established, and the caller would cache it in place of a name it
-		// already knew.
-		if ctx.Err() != nil {
-			return "", musem.Wrap(err, musem.EUNAVAILABLE, "git timed out resolving the branch at %s", dir)
-		}
-
-		// git ran and exited non-zero: dir is not a repository, which is a
-		// normal state for a session rather than a failure.
-		var exited *exec.ExitError
-		if errors.As(err, &exited) {
-			return "", nil
-		}
-
 		return "", musem.Wrap(err, musem.EUNAVAILABLE, "cannot run git in %s", dir)
 	}
 
-	branch := strings.TrimSpace(stdout.String())
+	branch := strings.TrimSpace(res.Stdout)
 	if branch == "HEAD" {
 		// Detached HEAD: there is no branch, and saying "HEAD" would read as one.
 		return "", nil
 	}
 	return branch, nil
-}
-
-// answeredBeforeItsChildLetGo reports that git did the job and only the plumbing
-// outlived it.
-//
-// WaitDelay closes the pipes when the process that holds their write end is not
-// the one that was waited on — an fsmonitor daemon, a background maintenance
-// run, anything git forks and detaches — and Run then reports ErrWaitDelay for a
-// git that exited zero. Taking that as a failure discards the name already
-// sitting in stdout and blanks the BRANCH column of every repository whose git
-// leaves a process behind, once per refresh and for as long as it does.
-//
-// The trailing newline is what separates a complete answer from a pipe cut
-// mid-word. git terminates the name with one, so output without it is a
-// fragment — and a fragment shown as a branch is precisely the confident wrong
-// label this resolver exists to refuse.
-func answeredBeforeItsChildLetGo(cmd *exec.Cmd, err error, out string) bool {
-	return errors.Is(err, exec.ErrWaitDelay) &&
-		cmd.ProcessState != nil && cmd.ProcessState.Success() &&
-		strings.HasSuffix(out, "\n")
 }

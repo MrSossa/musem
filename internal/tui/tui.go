@@ -30,10 +30,26 @@ type Model struct {
 	height   int
 	showHelp bool
 	detail   bool
+
+	// clock is read for the one age the view computes itself: how long a
+	// session has held its status. Every other age arrives already measured, by
+	// the registry that owns the timestamps behind it. Replaceable so a test can
+	// assert the rendered age without waiting for one.
+	clock func() time.Time
 }
 
 // NewModel returns an empty dashboard.
 func NewModel() Model { return Model{} }
+
+// now reads the model's clock, falling back to the real one. The fallback is
+// what lets Model stay usable as its zero value, which is how NewModel and every
+// test that builds a model by hand construct it.
+func (m Model) now() time.Time {
+	if m.clock != nil {
+		return m.clock()
+	}
+	return time.Now()
+}
 
 // Init satisfies tea.Model; the snapshot pump drives everything.
 func (m Model) Init() tea.Cmd { return nil }
@@ -51,7 +67,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// The list reorders as sessions change status, so the cursor is clamped
 		// rather than left pointing past the end.
 		if m.cursor >= len(m.snapshot.Rows) {
-			m.cursor = maxInt(0, len(m.snapshot.Rows)-1)
+			m.cursor = max(0, len(m.snapshot.Rows)-1)
 		}
 		return m, nil
 
@@ -88,7 +104,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "g", "home":
 		m.cursor = 0
 	case "G", "end":
-		m.cursor = maxInt(0, len(m.snapshot.Rows)-1)
+		m.cursor = max(0, len(m.snapshot.Rows)-1)
 	case "enter":
 		if len(m.snapshot.Rows) > 0 {
 			m.detail = !m.detail
@@ -171,7 +187,7 @@ func staleNotice(age time.Duration) string {
 func humanAge(d time.Duration) string {
 	switch {
 	case d < time.Minute:
-		return fmt.Sprintf("%ds", maxInt(1, int(d.Seconds())))
+		return fmt.Sprintf("%ds", max(1, int(d.Seconds())))
 	case d < time.Hour:
 		return fmt.Sprintf("%dm", int(d.Minutes()))
 	default:
@@ -227,7 +243,7 @@ func visibleColumns(width int) []column {
 	// scrolls the fleet total away — so the survivor is clamped to what is left
 	// after the cursor gutter and its trailing space.
 	if len(visible) == 1 {
-		visible[0].width = maxInt(1, minInt(visible[0].width, width-3))
+		visible[0].width = max(1, min(visible[0].width, width-3))
 	}
 	return visible
 }
@@ -320,7 +336,7 @@ func (m Model) View() string {
 	// line held back for bubbletea, which keeps the last m.height lines of the
 	// view whatever produced them. An overlay that overflows costs the header
 	// exactly as a long table does.
-	body := maxInt(1, m.height-lineCount(header)-lineCount(footer)-1)
+	body := max(1, m.height-lineCount(header)-lineCount(footer)-1)
 
 	switch {
 	case m.showHelp:
@@ -350,7 +366,7 @@ func (m Model) View() string {
 		// scrolls the whole frame away and leaves nothing readable at all.
 		budget := 0
 		if m.height > 0 {
-			budget = maxInt(1, m.height-lineCount(header)-lineCount(footer)-2)
+			budget = max(1, m.height-lineCount(header)-lineCount(footer)-2)
 		}
 		b.WriteString(m.renderTable(width, budget))
 	}
@@ -377,13 +393,13 @@ func lineCount(s string) int { return strings.Count(s, "\n") }
 //
 // The last kept line is replaced with an ellipsis so a clipped pane says it was
 // clipped, rather than appearing to end where it does not.
-func clipLines(s string, max, height int) string {
-	if height <= 0 || max <= 0 || lineCount(s) <= max {
+func clipLines(s string, limit, height int) string {
+	if height <= 0 || limit <= 0 || lineCount(s) <= limit {
 		return s
 	}
 
 	lines := strings.SplitAfter(s, "\n")
-	kept := lines[:maxInt(0, max-1)]
+	kept := lines[:max(0, limit-1)]
 	return strings.Join(kept, "") + styleDim.Render("  …") + "\n"
 }
 
@@ -431,7 +447,7 @@ func (m Model) renderHeader(width int) string {
 		total += " (understated)"
 	}
 	summary := fmt.Sprintf("   %d sessions   %s total", len(m.snapshot.Rows), total)
-	b.WriteString(styleDim.Render(padWide(summary, maxInt(0, width-widths.StringWidth(title)))))
+	b.WriteString(styleDim.Render(padWide(summary, max(0, width-widths.StringWidth(title)))))
 	b.WriteString("\n")
 
 	if m.snapshot.Stale {
@@ -439,7 +455,17 @@ func (m Model) renderHeader(width int) string {
 		b.WriteString("\n")
 	}
 	if msg := errorMessage(m.snapshot.ErrCode, m.snapshot.ErrMessage); msg != "" {
-		b.WriteString(styleErr.Render("  ✕ " + padWide(msg, maxInt(0, width-4))))
+		b.WriteString(styleErr.Render("  ✕ " + padWide(msg, max(0, width-4))))
+		b.WriteString("\n")
+	}
+	if n := m.snapshot.Undiscovered; n > 0 {
+		// Its own line, above the table rather than beside a row, because the
+		// sessions it counts have no row: they were dropped before anything
+		// could be shown about them. Without it, a source whose record shape
+		// changed empties the list and every session left in the registry reads
+		// as one that ended — a screen full of confident, wrong statuses.
+		b.WriteString(styleStale.Render(padWide(fmt.Sprintf(
+			"  ! %d session records could not be read; sessions may be missing from this list", n), width)))
 		b.WriteString("\n")
 	}
 	b.WriteString("\n")
@@ -479,7 +505,7 @@ func (m Model) renderTable(width, maxRows int) string {
 		if indicator {
 			window = maxRows - 1
 		}
-		start = minInt(maxInt(0, m.cursor-window/2), len(rows)-window)
+		start = min(max(0, m.cursor-window/2), len(rows)-window)
 		end = start + window
 	}
 
@@ -566,6 +592,11 @@ func statusSymbol(s musem.Status) string {
 		return "○"
 	case musem.StatusDead:
 		return "✕"
+	case musem.StatusEnded:
+		// Distinct from the cross a dead session gets. Finishing is not failing,
+		// and a glyph shared between them would undo in the symbol column the
+		// distinction the status column just made.
+		return "·"
 	default:
 		return "?"
 	}
@@ -578,10 +609,18 @@ func (m Model) renderDetail() string {
 	row := m.snapshot.Rows[m.cursor]
 	s := row.Session
 
+	// A status without its age is half the answer: waiting for four seconds is
+	// the loop working, waiting for ten minutes is a person blocked, and
+	// indeterminate for an hour means the signal is not coming back.
+	status := string(s.Status)
+	if !s.StatusSince.IsZero() {
+		status += " for " + humanAge(m.now().Sub(s.StatusSince))
+	}
+
 	lines := [][2]string{
 		{"Session", s.Name},
 		{"ID", s.ID},
-		{"Status", string(s.Status)},
+		{"Status", status},
 		{"Directory", s.Dir},
 		{"Branch", orDash(s.Branch)},
 		{"Cost", row.Cost.String()},
@@ -673,16 +712,5 @@ func formatTime(t time.Time) string {
 	return t.Format("2006-01-02 15:04:05")
 }
 
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
+// max and min are the language's own builtins, available since Go 1.21 and
+// therefore not worth hand-writing here.

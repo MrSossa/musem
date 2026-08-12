@@ -35,6 +35,7 @@ internal/
 ├── sqlite/                adapter: history persistence
 ├── git/                   adapter: branch resolution by shelling out
 ├── inmem/                 adapter: fake sessions for development and tests
+├── execx/                 helper: bounded subprocesses, a leaf by rule
 ├── registry/              orchestration: discovery, lifecycle, staleness
 ├── cost/                  orchestration: rates, computation, aggregation
 ├── app/                   composer: joins registry + cost into one snapshot
@@ -315,6 +316,66 @@ nobody audits them because nothing looks broken.
 trade.
 
 **Requirements it supports**: R9, R10
+
+### D14 · A degraded read is a value, not an absence
+
+**Chosen**: every reader that can partially fail returns a count of what it could
+not read, alongside what it could. `musem.UsageReading` does it for transcripts
+and `musem.Discovery` does it for the session list; both counts travel to the
+view and are rendered as their own state, distinct from an error and distinct
+from staleness.
+
+**Rejected alternatives**: skipping unreadable records silently, which is what
+the discovery path did until the phase-3 review. It reads as defensive — one bad
+record does not cost you the others — and hides the case where every record is
+bad: an empty list is indistinguishable from a machine running nothing, and the
+registry answers that by marking every known session ended.
+
+**Consequences**: three states have to be told apart wherever data arrives —
+failed, stale, and incomplete — and each needs its own channel to the view. That
+is the cost. What it buys is that no foreign format change can empty the
+dashboard quietly.
+
+**Requirements it supports**: R6, R20
+
+### D15 · Foreign text is stripped where it becomes a musem value
+
+**Chosen**: control characters are removed from session names, directories and
+model identifiers in the `claude` adapter, at the point the foreign payload
+becomes a `musem` type.
+
+**Rejected alternatives**: escaping in the renderer. The dashboard is not the
+only consumer a value can reach, and a defence in the view has to be repeated by
+every future view; one at the boundary holds for all of them. Also rejected:
+replacing stripped characters with a substitution glyph, which would let a
+crafted name masquerade as a legitimately odd one.
+
+**Consequences**: a name is no longer byte-identical to what the source reported.
+That is the trade, and it is the right way round — the dashboard redraws every
+refresh, so a name carrying an escape sequence is an instruction re-issued to the
+terminal continuously, not a one-off glitch.
+
+**Requirements it supports**: R19
+
+### D16 · Shared subprocess handling in a leaf package
+
+**Chosen**: `internal/execx` runs a command under a timeout and classifies the
+outcome into the four shapes callers act on differently — not found, timed out,
+exited non-zero, failed. Both shelling adapters use it.
+
+**Rejected alternatives**: leaving each adapter with its own copy. The subtle
+part — a forked child holding the pipe open past a process that exited zero — was
+already implemented twice and had already drifted.
+
+**Consequences**: `execx` is not an adapter, and the distinction matters enough
+to assert: it wraps the standard library rather than a foreign system, so it
+imports nothing from musem and stays a leaf. A shared package that starts
+importing the domain becomes a second composition root every adapter depends on.
+The success predicate stays with the caller, because the evidence genuinely
+differs between them.
+
+**Requirements it supports**: none directly; it serves R1 and R4 by keeping their
+adapters honest about what "no answer" means.
 
 ## Impact
 
