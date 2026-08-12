@@ -58,6 +58,15 @@ func (r *BranchResolver) Branch(ctx context.Context, dir string) (string, error)
 	cmd.Stdout = &stdout
 	cmd.Stderr = nil
 
+	// Killing the process is not the same as getting the call back. Run waits
+	// for the goroutine copying into these buffers, and that goroutine finishes
+	// only when every process holding the pipe's write end has exited — the
+	// context kills the direct child, not a grandchild it left behind. Without a
+	// delay a credential helper, a hook, or anything wedged on a stalled mount
+	// holds this call open past the timeout and freezes the refresh loop the
+	// timeout exists to protect.
+	cmd.WaitDelay = time.Second
+
 	if err := cmd.Run(); err != nil {
 		// Distinguish "git is not installed" from "this is not a repository".
 		// The first is worth telling the user about; the second is routine.
@@ -65,7 +74,23 @@ func (r *BranchResolver) Branch(ctx context.Context, dir string) (string, error)
 		if errors.As(err, &notFound) {
 			return "", musem.Wrap(err, musem.EUNAVAILABLE, "git was not found on PATH")
 		}
-		return "", nil
+
+		// A git that was killed rather than answered says nothing about dir.
+		// Reporting that as "no branch" would be a claim this call never
+		// established, and the caller would cache it in place of a name it
+		// already knew.
+		if ctx.Err() != nil {
+			return "", musem.Wrap(err, musem.EUNAVAILABLE, "git timed out resolving the branch at %s", dir)
+		}
+
+		// git ran and exited non-zero: dir is not a repository, which is a
+		// normal state for a session rather than a failure.
+		var exited *exec.ExitError
+		if errors.As(err, &exited) {
+			return "", nil
+		}
+
+		return "", musem.Wrap(err, musem.EUNAVAILABLE, "cannot run git in %s", dir)
 	}
 
 	branch := strings.TrimSpace(stdout.String())
