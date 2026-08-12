@@ -1087,3 +1087,56 @@ func TestCursorEndLineageSurvivesTheFileBecomingIdentifiable(t *testing.T) {
 		t.Errorf("got %d entries, want the 10 appended after adoption", len(next.Entries))
 	}
 }
+
+// A session identifier is pasted into a glob pattern, where a separator or a
+// metacharacter stops meaning itself. Both are refused at the edge rather than
+// resolved to a plausible wrong file and counted against the session.
+func TestUsageReaderRejectsIdentifiersThatEscapeTheSearch(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "project")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	line := `{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":9}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(project, "real.jsonl"), []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A transcript outside the projects root, which no identifier may reach.
+	if err := os.WriteFile(filepath.Join(root, "outside.jsonl"), []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, id := range []string{
+		"",           // nothing to search for
+		"../outside", // climbs out of the projects root
+		"a/b",        // a separator by any other route
+		"*",          // matches whatever transcript happens to be first
+		"rea?",       // ditto, one character at a time
+		"[r]eal",     // a character class
+	} {
+		t.Run(id, func(t *testing.T) {
+			r := &UsageReader{ProjectsDir: root}
+			reading, err := r.ReadUsage(context.Background(), id, "")
+			if err == nil {
+				t.Fatalf("ReadUsage(%q) succeeded, reading = %+v", id, reading)
+			}
+			if got := musem.ErrorCode(err); got != musem.EINVALID {
+				t.Errorf("ReadUsage(%q) code = %q, want %q", id, got, musem.EINVALID)
+			}
+			if len(reading.Entries) != 0 {
+				t.Errorf("ReadUsage(%q) returned %d entries; nothing may be counted", id, len(reading.Entries))
+			}
+		})
+	}
+
+	// The ordinary case still resolves, so the check narrows nothing it should not.
+	r := &UsageReader{ProjectsDir: root}
+	reading, err := r.ReadUsage(context.Background(), "real", "")
+	if err != nil {
+		t.Fatalf("ReadUsage(\"real\"): %v", err)
+	}
+	if len(reading.Entries) != 1 {
+		t.Errorf("a well-formed identifier must still resolve, got %+v", reading)
+	}
+}

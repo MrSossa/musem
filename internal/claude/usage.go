@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -97,6 +98,10 @@ func (r *UsageReader) forget(sessionID string) {
 // from the registry, so without this a session whose transcript was deleted
 // would re-scan every project directory on every refresh, forever.
 func (r *UsageReader) resolve(sessionID string) (string, error) {
+	if err := checkSessionID(sessionID); err != nil {
+		return "", err
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.init()
@@ -148,6 +153,36 @@ func (r *UsageReader) resolve(sessionID string) (string, error) {
 	delete(r.retry, sessionID)
 	r.paths[sessionID] = best
 	return best, nil
+}
+
+// checkSessionID rejects identifiers that would not stay inside the search this
+// reader intends to perform.
+//
+// The identifier arrives from another tool's JSON and is pasted into a glob
+// pattern, where two ordinary-looking strings stop meaning themselves. A
+// separator escapes the projects root — filepath.Join cleans "../.." into the
+// path rather than refusing it, so "../../etc/x" lands outside the tree
+// entirely. A metacharacter widens the match instead of narrowing it: a bare
+// "*" expands to */*.jsonl and adopts the first transcript on disk, which is how
+// one session's tokens end up billed to another's row.
+//
+// This is not a trust boundary — a hostile `claude agents --json` already runs
+// as the user — so the point is not defence. It is that a malformed identifier
+// should fail as one, loudly and at the edge, rather than resolve to a plausible
+// wrong file and be counted.
+func checkSessionID(sessionID string) error {
+	if sessionID == "" {
+		return musem.Errorf(musem.EINVALID, "session id is required")
+	}
+	if strings.ContainsRune(sessionID, os.PathSeparator) || strings.ContainsRune(sessionID, '/') {
+		return musem.Errorf(musem.EINVALID,
+			"session id %q contains a path separator", sessionID)
+	}
+	if strings.ContainsAny(sessionID, `*?[\`) {
+		return musem.Errorf(musem.EINVALID,
+			"session id %q contains a pattern character", sessionID)
+	}
+	return nil
 }
 
 // newest returns the most recently modified match.
