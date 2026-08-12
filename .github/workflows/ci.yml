@@ -54,13 +54,27 @@ jobs:
       - name: build
         run: go build -o bin/musem ./cmd/musem
 
-      - name: assert the binary is statically linked
+      # The build setting is read back off the binary rather than inferred from
+      # its symbols. An earlier version of this step grepped `go tool nm` for
+      # " U _cgo", which never matches anything: the toolchain emits cgo symbols
+      # as defined, not undefined, so the check passed even for a genuinely
+      # cgo-linked binary. A check that cannot fail is worse than no check —
+      # it reports an invariant nobody is holding.
+      # Matched as fixed strings. \s is a GNU extension, and the macOS runners
+      # use BSD grep, where it degrades to a literal "s" and quietly matches
+      # nothing — which would fail this leg of the matrix on every pull request.
+      - name: assert the binary was built without cgo
         run: |
-          if go tool nm bin/musem 2>/dev/null | grep -q ' U _cgo'; then
-            echo "binary contains cgo references: CGO_ENABLED=0 was not honoured"
+          settings=$(go version -m bin/musem)
+          if ! echo "$settings" | grep -qF 'CGO_ENABLED='; then
+            echo "the binary records no CGO_ENABLED setting; this check cannot vouch for it"
             exit 1
           fi
-          echo "no cgo references found"
+          if ! echo "$settings" | grep -qF 'CGO_ENABLED=0'; then
+            echo "binary was built with cgo enabled: CGO_ENABLED=0 was not honoured"
+            exit 1
+          fi
+          echo "binary records CGO_ENABLED=0"
 
   lint:
     name: lint
@@ -71,7 +85,11 @@ jobs:
         with:
           go-version: stable
           cache: true
-      - uses: golangci/golangci-lint-action@v6
+      # v8 or newer is required: .golangci.yml is a version "2" config, and the
+      # action only learned to install golangci-lint v2 in v7. Pairing a v6
+      # action with a v2 config fails the job however the version input is set,
+      # which fails the aggregator below and blocks every pull request.
+      - uses: golangci/golangci-lint-action@v8
         with:
           version: latest
 
