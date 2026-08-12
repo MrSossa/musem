@@ -16,5 +16,6 @@ coverage.txt
 .idea/
 .vscode/
 
-# OpenSpec commands/skills live in ~/.claude (the user's global config)
+# ktools commands/skills live in ~/.claude (the user's global config).
+# CLAUDE.md at the repo root is tracked; the .claude/ directory is not.
 .claude/

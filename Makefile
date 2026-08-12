@@ -1,7 +1,8 @@
 .PHONY: build test race lint vet fmt run clean
 
 # CGO_ENABLED=0 is a project invariant: it is what keeps cross-compilation to
-# macOS and Linux possible from a single machine. See openspec design notes.
+# macOS and Linux possible from a single machine. See the design notes under
+# .ktools/.
 export CGO_ENABLED = 0
 
 BIN := bin/musem

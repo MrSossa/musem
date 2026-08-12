@@ -90,7 +90,8 @@ point inward, adapters wrap exactly one foreign thing each, the UI fetches
 nothing, and nothing reaches the network. Directory names do not enforce
 boundaries; the direction of the imports does.
 
-Planning artifacts live in `openspec/`.
+Planning artifacts live in `.ktools/`: open changes under `.ktools/changes/`,
+living specs under `.ktools/specs/`.
 
 ## Workflow: GitHub flow
 
