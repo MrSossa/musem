@@ -1,0 +1,22 @@
+[
+  {
+    "pid": 100,
+    "cwd": "/home/dev/projects/gamma",
+    "kind": "interactive",
+    "startedAt": 1786287490233,
+    "sessionId": "aaaaaaaa-0000-0000-0000-000000000001",
+    "name": "gamma",
+    "status": "idle",
+    "someFutureField": {"nested": true},
+    "anotherOne": 42
+  },
+  {
+    "pid": 101,
+    "cwd": "/home/dev/projects/delta",
+    "kind": "interactive",
+    "startedAt": 1786287490999,
+    "sessionId": "aaaaaaaa-0000-0000-0000-000000000002",
+    "name": "delta",
+    "status": "a-status-musem-has-never-seen"
+  }
+]
