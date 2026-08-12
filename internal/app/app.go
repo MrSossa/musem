@@ -10,6 +10,7 @@ package app
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/MrSossa/musem"
 	"github.com/MrSossa/musem/internal/cost"
@@ -29,6 +30,18 @@ type Row struct {
 	// is an understatement, and saying so is the difference between a number
 	// the user can audit and one they cannot.
 	Degraded bool
+
+	// Priced is the dollars accumulated from this session's usage that did have
+	// a rate. It is what is left to show once one unpriceable model has made the
+	// cost itself unknown: the figure is a floor rather than a total, and a
+	// floor is worth more than nothing at all.
+	Priced float64
+
+	// UnknownModels names the models this session used that have no known rate.
+	// Carried through to the view because naming them is what turns "the cost
+	// is incomplete" into something the user can act on — a gap they can close
+	// by adding a rate, rather than one they can only be told about.
+	UnknownModels []string
 }
 
 // Snapshot is everything the dashboard renders in one pass.
@@ -52,13 +65,56 @@ type Composer struct {
 	// in. The registry never drops a session, so without this the refresh loop
 	// grows without bound and spends every pass re-reading records that stopped
 	// changing hours ago.
+	//
+	// failing records when an ended session's final read first failed, so a
+	// transcript that will never be readable stops being chased.
 	mu      sync.Mutex
 	settled map[string]bool
+	failing map[string]time.Time
+
+	now func() time.Time
+}
+
+// finalReadGrace bounds how long an ended session's last read keeps being
+// retried before it is settled regardless.
+//
+// A failed read says nothing, so one failure must not settle a session — but a
+// transcript that was deleted never becomes readable, and each attempt walks
+// every project directory looking for it.
+//
+// The bound is time, not a count of attempts, because attempts are cheap in a
+// way that misleads: the reader remembers a failed search for DefaultRetryLookup
+// and answers from that memory without looking, so a budget of three tries would
+// be spent in a few seconds on two answers nobody went and fetched. A session
+// whose transcript is merely late needs wall-clock time, not passes.
+const finalReadGrace = 2 * time.Minute
+
+// Option configures a Composer.
+type Option func(*Composer)
+
+// WithClock replaces the clock, so a test can reach the retry grace without
+// waiting for it.
+func WithClock(now func() time.Time) Option {
+	return func(c *Composer) {
+		if now != nil {
+			c.now = now
+		}
+	}
 }
 
 // New returns a Composer over the given sources.
-func New(r *registry.Registry, a *cost.Accountant) *Composer {
-	return &Composer{registry: r, accountant: a, settled: make(map[string]bool)}
+func New(r *registry.Registry, a *cost.Accountant, opts ...Option) *Composer {
+	c := &Composer{
+		registry:   r,
+		accountant: a,
+		settled:    make(map[string]bool),
+		failing:    make(map[string]time.Time),
+		now:        time.Now,
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // Snapshot joins the current inventory with current costs, preserving the
@@ -67,19 +123,32 @@ func (c *Composer) Snapshot() Snapshot {
 	inventory := c.registry.Snapshot()
 
 	rows := make([]Row, 0, len(inventory.Sessions))
+	ids := make([]string, 0, len(inventory.Sessions))
 	for _, s := range inventory.Sessions {
-		row := Row{Session: s, Cost: musem.USD(0)}
+		// A session the accountant has never recorded is one whose usage could
+		// not be read, not one that cost nothing. USD(0) here would render a
+		// confident $0.00, with no marker, for a session burning real money.
+		// The em dash needs no marker beside it: unlike a starred figure, it is
+		// not a number claiming to be short — it is the absence of one.
+		row := Row{Session: s, Cost: musem.UnknownCost()}
 		if sc, ok := c.accountant.Session(s.ID); ok {
 			row.Cost = sc.Cost
 			row.Partial = sc.Partial()
 			row.Degraded = sc.Degraded()
+			row.UnknownModels = sc.UnknownModels
+			row.Priced = sc.Priced
 		}
 		rows = append(rows, row)
+		ids = append(ids, s.ID)
 	}
 
+	// The total covers exactly the sessions listed beside it. The accountant
+	// holds more than that — history outlives the sessions that made it — and a
+	// figure summed over all of it under a count of the few on screen would
+	// belong to neither.
 	return Snapshot{
 		Rows:       rows,
-		Fleet:      c.accountant.Total(),
+		Fleet:      c.accountant.Total(ids),
 		Stale:      inventory.Stale,
 		ErrCode:    inventory.ErrCode,
 		ErrMessage: inventory.ErrMessage,
@@ -96,13 +165,27 @@ func (c *Composer) Snapshot() Snapshot {
 // what catches anything written between the last refresh and the session
 // disappearing; after it there is nothing left to arrive, and the accumulated
 // total stays where it is whether or not the record still exists.
+//
+// A successful final read settles a session. A read that failed says nothing
+// about whether more usage is waiting — the transcript may simply not have been
+// written yet — so it is retried, but only for finalReadGrace: a record that was
+// deleted will not appear however long it is chased.
 func (c *Composer) Refresh(ctx context.Context) {
 	for _, s := range c.registry.Snapshot().Sessions {
-		if s.Ended() && c.isSettled(s.ID) {
+		if !s.Ended() {
+			// A session that reappears is live again, and the registry has
+			// already cleared its end. Forgetting that it was settled is what
+			// keeps its second ending from skipping the final read.
+			c.unsettle(s.ID)
+		} else if c.isSettled(s.ID) {
 			continue
 		}
-		_ = c.accountant.Update(ctx, s.ID)
-		if s.Ended() {
+
+		err := c.accountant.Update(ctx, s.ID)
+		if !s.Ended() {
+			continue
+		}
+		if err == nil || c.exhausted(s.ID) {
 			c.settle(s.ID)
 		}
 	}
@@ -121,4 +204,30 @@ func (c *Composer) settle(id string) {
 		c.settled = make(map[string]bool)
 	}
 	c.settled[id] = true
+	delete(c.failing, id)
+}
+
+func (c *Composer) unsettle(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.settled, id)
+	delete(c.failing, id)
+}
+
+// exhausted notes that an ended session's final read failed and reports whether
+// it has been failing long enough to stop chasing.
+func (c *Composer) exhausted(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failing == nil {
+		c.failing = make(map[string]time.Time)
+	}
+
+	now := c.now()
+	first, ok := c.failing[id]
+	if !ok {
+		c.failing[id] = now
+		return false
+	}
+	return now.Sub(first) >= finalReadGrace
 }

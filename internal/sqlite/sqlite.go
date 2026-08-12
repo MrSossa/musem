@@ -14,13 +14,31 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/MrSossa/musem"
 
-	_ "modernc.org/sqlite" // registers the "sqlite" driver
+	sqlitedriver "modernc.org/sqlite" // registers the "sqlite" driver
+	sqlitelib "modernc.org/sqlite/lib"
 )
+
+// busy reports whether err is SQLite refusing to wait for a lock.
+//
+// Concurrent openers contend for the write lock while migrating, and the busy
+// handler is deliberately not invoked for the lock upgrades that could deadlock
+// — SQLite returns immediately instead and leaves the retry to the caller. The
+// code is read from the driver's own error type rather than matched in its
+// message, which is prose and not a contract.
+func busy(err error) bool {
+	var e *sqlitedriver.Error
+	if !errors.As(err, &e) {
+		return false
+	}
+	return e.Code() == sqlitelib.SQLITE_BUSY || e.Code() == sqlitelib.SQLITE_LOCKED
+}
 
 // DefaultPath returns the database location inside the user's config
 // directory, creating the directory if needed.
@@ -98,30 +116,120 @@ var migrations = []string{
 	// is bounded by one refresh interval. Counting a session twice is a wrong
 	// number that looks right; losing a couple of seconds is neither.
 	`UPDATE session_costs SET read_cursor = 'end' WHERE read_cursor = ''`,
+
+	// The dollars accumulated from priceable usage, kept apart from cost_usd
+	// because cost_usd is zero whenever cost_known is 0 — so a session that
+	// met one unpriceable model would otherwise resume from nothing.
+	`ALTER TABLE session_costs ADD COLUMN priced_usd REAL NOT NULL DEFAULT 0`,
+
+	// Rows written before the column existed carry their accumulated dollars in
+	// cost_usd, but only where the cost was known. Where it was not, those
+	// dollars were already lost by the bug this column exists to fix and there
+	// is nothing left to recover: the session resumes from zero and climbs
+	// again as new usage arrives.
+	`UPDATE session_costs SET priced_usd = cost_usd WHERE cost_known = 1`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx,
-		`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)`); err != nil {
+	if err := retryWhileBusy(ctx, func() error {
+		_, err := s.db.ExecContext(ctx,
+			`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)`)
+		return err
+	}); err != nil {
 		return musem.Wrap(err, musem.EINTERNAL, "cannot create the schema version table")
 	}
 
-	var current int
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&current)
+	// Each migration and the record that it ran commit together. SQLite has
+	// transactional DDL, so this is possible — and necessary: a process that
+	// died between the two would leave a schema that has moved on and a version
+	// that has not, and the next start would replay an ALTER whose column
+	// already exists. That fails, and goes on failing, taking every session's
+	// accumulated cost with it.
+	//
+	// The version is re-read inside each transaction rather than once up front.
+	// Two musem processes starting together would otherwise both see the same
+	// version and both apply the next migration: the second one's ALTER hits a
+	// column that already exists, its Open fails, and it runs with history
+	// disabled — silently forgetting every session's cost for that run. A
+	// concurrent musem is a case the package sets out to support, not an
+	// exotic one.
+	for {
+		var applied bool
+		if err := retryWhileBusy(ctx, func() error {
+			var err error
+			applied, err = s.migrateOne(ctx)
+			return err
+		}); err != nil {
+			return err
+		}
+		if !applied {
+			return nil
+		}
+	}
+}
+
+// migrationRetries bounds how long an opener waits for another process to
+// finish migrating before giving up. Contention lasts as long as one migration
+// takes, which is milliseconds; the ceiling is here so a wedged peer cannot
+// hold startup indefinitely.
+const migrationRetries = 50
+
+// retryWhileBusy runs f until it stops reporting a lock it will not wait for.
+// Any other error is returned as it is, immediately.
+func retryWhileBusy(ctx context.Context, f func() error) error {
+	var err error
+	for attempt := 0; attempt < migrationRetries; attempt++ {
+		if err = f(); !busy(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	return err
+}
+
+// migrateOne applies the next outstanding migration, reporting whether there
+// was one. It re-reads the schema version under the write lock, so a migration
+// another process committed in the meantime is seen rather than repeated.
+func (s *Store) migrateOne(ctx context.Context) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return musem.Wrap(err, musem.EINTERNAL, "cannot read the schema version")
+		return false, musem.Wrap(err, musem.EINTERNAL, "cannot begin a migration")
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// A write before the read, so this transaction holds the write lock while it
+	// decides what to do. Without it two processes read the same version, both
+	// decide the same migration is outstanding, and the loser's DDL fails
+	// against a schema the winner has already moved.
+	if _, err := tx.ExecContext(ctx, `UPDATE schema_version SET version = version WHERE 0`); err != nil {
+		return false, musem.Wrap(err, musem.EINTERNAL, "cannot take the migration lock")
 	}
 
-	for i := current; i < len(migrations); i++ {
-		if _, err := s.db.ExecContext(ctx, migrations[i]); err != nil {
-			return musem.Wrap(err, musem.EINTERNAL, "migration %d failed", i+1)
-		}
-		if _, err := s.db.ExecContext(ctx,
-			`INSERT INTO schema_version (version) VALUES (?)`, i+1); err != nil {
-			return musem.Wrap(err, musem.EINTERNAL, "cannot record schema version %d", i+1)
-		}
+	var current int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&current); err != nil {
+		return false, musem.Wrap(err, musem.EINTERNAL, "cannot read the schema version")
 	}
-	return nil
+	if current >= len(migrations) {
+		return false, nil
+	}
+
+	if _, err := tx.ExecContext(ctx, migrations[current]); err != nil {
+		return false, musem.Wrap(err, musem.EINTERNAL, "migration %d failed", current+1)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO schema_version (version) VALUES (?)`, current+1); err != nil {
+		return false, musem.Wrap(err, musem.EINTERNAL, "cannot record schema version %d", current+1)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, musem.Wrap(err, musem.EINTERNAL, "cannot commit migration %d", current+1)
+	}
+	return true, nil
 }
 
 // Save writes one session's accounting, replacing any previous row.
@@ -138,8 +246,8 @@ func (s *Store) Save(ctx context.Context, sc musem.SessionCost) error {
 			session_id, input_tokens, output_tokens,
 			cache_write_5m, cache_write_1h, cache_read_tokens,
 			cost_usd, cost_known, unknown_models,
-			read_cursor, skipped_records, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+			read_cursor, skipped_records, priced_usd, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
 		ON CONFLICT(session_id) DO UPDATE SET
 			input_tokens      = excluded.input_tokens,
 			output_tokens     = excluded.output_tokens,
@@ -151,12 +259,13 @@ func (s *Store) Save(ctx context.Context, sc musem.SessionCost) error {
 			unknown_models    = excluded.unknown_models,
 			read_cursor       = excluded.read_cursor,
 			skipped_records   = excluded.skipped_records,
+			priced_usd        = excluded.priced_usd,
 			updated_at        = excluded.updated_at`,
 		sc.SessionID,
 		sc.Usage.InputTokens, sc.Usage.OutputTokens,
 		sc.Usage.CacheWrite5mTokens, sc.Usage.CacheWrite1hTokens, sc.Usage.CacheReadTokens,
 		amount, boolToInt(known), string(unknown),
-		sc.Cursor, sc.Skipped,
+		sc.Cursor, sc.Skipped, sc.Priced,
 	)
 	if err != nil {
 		return musem.Wrap(err, musem.EUNAVAILABLE, "cannot save usage for session %s", sc.SessionID)
@@ -170,7 +279,7 @@ func (s *Store) Load(ctx context.Context) (map[string]musem.SessionCost, error) 
 		SELECT session_id, input_tokens, output_tokens,
 		       cache_write_5m, cache_write_1h, cache_read_tokens,
 		       cost_usd, cost_known, unknown_models,
-		       read_cursor, skipped_records
+		       read_cursor, skipped_records, priced_usd
 		FROM session_costs`)
 	if err != nil {
 		return nil, musem.Wrap(err, musem.EUNAVAILABLE, "cannot read usage history")
@@ -190,7 +299,7 @@ func (s *Store) Load(ctx context.Context) (map[string]musem.SessionCost, error) 
 			&sc.Usage.InputTokens, &sc.Usage.OutputTokens,
 			&sc.Usage.CacheWrite5mTokens, &sc.Usage.CacheWrite1hTokens, &sc.Usage.CacheReadTokens,
 			&amount, &known, &unknown,
-			&sc.Cursor, &sc.Skipped,
+			&sc.Cursor, &sc.Skipped, &sc.Priced,
 		); err != nil {
 			return nil, musem.Wrap(err, musem.EUNPARSEABLE, "malformed history row")
 		}

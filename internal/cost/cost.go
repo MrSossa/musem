@@ -99,13 +99,21 @@ func (a *Accountant) Update(ctx context.Context, sessionID string) error {
 	if err != nil {
 		return err
 	}
-	if len(reading.Entries) == 0 && reading.Skipped == 0 && reading.Cursor == cursor {
+	if len(reading.Entries) == 0 && reading.Skipped == 0 && reading.Cursor == cursor && !reading.Reset {
 		return nil
 	}
 	fresh := reading.Entries
 
 	a.mu.Lock()
 	sc := a.costs[sessionID]
+	if reading.Reset {
+		// The source record was replaced or truncated and is being read from
+		// its beginning again, so everything derived from it has to go. Adding
+		// this reading to totals that already contain the same records would
+		// double them; keeping the old totals and the new records together
+		// would be the same mistake spread over two passes.
+		sc = musem.SessionCost{}
+	}
 	sc.SessionID = sessionID
 	sc.Cursor = reading.Cursor
 	sc.Skipped += reading.Skipped
@@ -115,15 +123,15 @@ func (a *Accountant) Update(ctx context.Context, sessionID string) error {
 		unknown[m] = true
 	}
 
-	// Accumulated dollars are tracked separately from the domain Cost so a
-	// single unpriceable entry does not poison the arithmetic for everything
-	// priced before or after it.
-	known, _ := sc.Cost.Amount()
+	// Accumulated dollars live in their own field rather than being read back
+	// out of the domain Cost, so a single unpriceable entry does not destroy
+	// the arithmetic for everything priced before or after it.
+	known := sc.Priced
 
 	for _, mu := range fresh {
 		sc.Usage.Add(mu.Usage)
 
-		rate, ok := a.rates.Lookup(mu.Model)
+		rate, ok := a.rates.LookupAt(mu.Model, mu.At)
 		if !ok {
 			unknown[mu.Model] = true
 			continue
@@ -137,6 +145,7 @@ func (a *Accountant) Update(ctx context.Context, sessionID string) error {
 		})
 	}
 
+	sc.Priced = known
 	sc.UnknownModels = sortedKeys(unknown)
 	if len(sc.UnknownModels) > 0 {
 		// Tokens are still counted; only the money is unavailable. Reporting a
@@ -171,15 +180,62 @@ type Fleet struct {
 	// UnknownModels names every model that could not be priced anywhere in the
 	// fleet. Non-empty means Cost is unknown, and says which gaps to close.
 	UnknownModels []string
+
+	// Skipped is how many records were passed over as unreadable across the
+	// whole fleet. It is carried here for the same reason it is carried per
+	// session: without it the aggregate silently understates, and a total that
+	// is too low with nothing to say so is the number nobody audits.
+	Skipped int
+
+	// Priced is the dollars accumulated across these sessions from usage that
+	// did have a rate. It is the floor under an unknown total.
+	//
+	// Without it the headline discards every priced dollar the moment one
+	// session touches a model with no rate — nine sessions worth $412 render as
+	// an em dash while the rows beneath them still show their figures, leaving
+	// the summary strictly less informative than the list it summarises. It is
+	// the same gap SessionCost.Priced closes one level down.
+	Priced float64
+
+	// Unrecorded counts sessions asked for that the accountant holds no figures
+	// for at all, because their usage has never been read successfully. They
+	// contribute nothing to the total, so it is missing whole sessions rather
+	// than merely parts of them.
+	//
+	// The total stays a real figure rather than going unknown, and is reported
+	// beside this count. Sessions are never dropped from the inventory, so one
+	// session that ended before its transcript could be found would otherwise
+	// hold the headline figure at an em dash for the rest of the run however
+	// many priced sessions came and went — an outage dressed as honesty. A
+	// figure that names what it is missing is neither silent nor useless.
+	Unrecorded int
 }
 
-// Partial reports whether some part of the fleet total could not be priced.
-func (f Fleet) Partial() bool { return len(f.UnknownModels) > 0 }
+// Partial reports whether some part of the fleet total is missing, whether
+// because it could not be priced or because a whole session never reached the
+// accounting. It is the one-question form; a caller that distinguishes the two
+// gaps asks Unpriceable and reads Unrecorded.
+func (f Fleet) Partial() bool { return f.Unpriceable() || f.Unrecorded > 0 }
 
-// Total aggregates every session. Tokens always add up; the cost is unknown as
-// soon as any component is, because a total silently missing a component cannot
-// be told apart from a complete one.
-func (a *Accountant) Total() Fleet {
+// Unpriceable reports whether usage reached the total but could not be priced.
+func (f Fleet) Unpriceable() bool { return len(f.UnknownModels) > 0 }
+
+// Degraded reports whether some usage never reached the total at all, because
+// the records carrying it could not be read. Distinct from Partial: partial
+// means counted but unpriceable, degraded means never counted.
+func (f Fleet) Degraded() bool { return f.Skipped > 0 }
+
+// Total aggregates the named sessions. Tokens always add up; the cost is
+// unknown as soon as any component is, because a total silently missing a
+// component cannot be told apart from a complete one.
+//
+// The caller names the sessions rather than getting everything the accountant
+// holds. History outlives the sessions that produced it — the store is loaded
+// whole at startup and nothing is ever evicted — so totalling the map would
+// pair a figure covering every session ever seen with a count of the few on
+// screen, and one old session that met an unpriced model would hold the total
+// unknown for every future run.
+func (a *Accountant) Total(sessionIDs []string) Fleet {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
@@ -187,9 +243,18 @@ func (a *Accountant) Total() Fleet {
 	unknown := make(map[string]bool)
 	total := musem.USD(0)
 
-	for _, sc := range a.costs {
+	for _, id := range sessionIDs {
+		sc, ok := a.costs[id]
+		if !ok {
+			// Asked for and never recorded: its usage could not be read, so
+			// whatever it spent is missing from every figure here.
+			fleet.Unrecorded++
+			continue
+		}
 		fleet.Usage.Add(sc.Usage)
 		total = total.Add(sc.Cost)
+		fleet.Priced += sc.Priced
+		fleet.Skipped += sc.Skipped
 		for _, m := range sc.UnknownModels {
 			unknown[m] = true
 		}

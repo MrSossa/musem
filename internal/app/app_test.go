@@ -4,8 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/MrSossa/musem"
 	"github.com/MrSossa/musem/internal/app"
@@ -85,6 +88,9 @@ func TestComposerPreservesUrgencyOrdering(t *testing.T) {
 	}
 	if rows[0].Session.Status != musem.StatusWaiting {
 		t.Errorf("first row is %q; a waiting session should lead", rows[0].Session.Status)
+	}
+	if last := rows[len(rows)-1].Session; !last.Ended() {
+		t.Errorf("last row is %q and has not ended; finished sessions belong at the bottom", last.Status)
 	}
 }
 
@@ -267,5 +273,256 @@ func TestRestartDoesNotRecountWithTheRealAdapters(t *testing.T) {
 		if amount < 4.99 || amount > 5.01 {
 			t.Errorf("cost = %.2f on launch %d, want the unchanged 5.00", amount, i)
 		}
+	}
+}
+
+// controllableReader reports usage for a session and can be made to fail, so a
+// final read can be forced to fail exactly when a session ends.
+type controllableReader struct {
+	mu     sync.Mutex
+	fail   bool
+	reads  map[string]int
+	failed map[string]int
+}
+
+func newControllableReader() *controllableReader {
+	return &controllableReader{reads: make(map[string]int), failed: make(map[string]int)}
+}
+
+// failCount reports how many reads were attempted while the reader was failing.
+func (r *controllableReader) failCount(sessionID string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.failed[sessionID]
+}
+
+func (r *controllableReader) ReadUsage(_ context.Context, sessionID, cursor string) (musem.UsageReading, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.fail {
+		r.failed[sessionID]++
+		return musem.UsageReading{}, musem.Errorf(musem.ENOTFOUND, "no transcript for %s", sessionID)
+	}
+	r.reads[sessionID]++
+
+	// Each successful read reports a little more usage, so a read that was
+	// skipped is visible as a total that failed to move.
+	return musem.UsageReading{
+		Entries: []musem.ModelUsage{{
+			Model: "claude-opus-5",
+			Usage: musem.Usage{OutputTokens: 1_000_000},
+		}},
+		Cursor: strconv.Itoa(r.reads[sessionID]),
+	}, nil
+}
+
+func (r *controllableReader) readCount(sessionID string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reads[sessionID]
+}
+
+func (r *controllableReader) setFail(fail bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fail = fail
+}
+
+// wireWith builds the same graph as wire around a caller-supplied reader and
+// discoverer, so a test can drive both ends.
+func wireWith(d *inmem.Discoverer, reader cost.UsageReader) (*app.Composer, *registry.Registry) {
+	reg := registry.New(d, inmem.BranchResolver{})
+	return app.New(reg, cost.New(cost.NewRateTable(), reader, nil)), reg
+}
+
+func live(id string) []musem.Session {
+	return []musem.Session{{ID: id, Name: id, Dir: "/p/" + id, Status: musem.StatusRunning}}
+}
+
+// An ended session gets one last read. If that read fails it has told us
+// nothing, and settling on it abandons the session's final usage for good.
+func TestFailedFinalReadIsRetried(t *testing.T) {
+	ctx := context.Background()
+	d := inmem.NewDiscoverer()
+	d.SetSessions(live("s1"))
+
+	reader := newControllableReader()
+	composer, reg := wireWith(d, reader)
+
+	reg.Refresh(ctx)
+	composer.Refresh(ctx)
+
+	// The session ends, and its final read fails — the transcript has not been
+	// written yet, or the filesystem was briefly unavailable.
+	d.SetSessions(nil)
+	reg.Refresh(ctx)
+	reader.setFail(true)
+	composer.Refresh(ctx)
+
+	before := reader.readCount("s1")
+	reader.setFail(false)
+	composer.Refresh(ctx)
+
+	if reader.readCount("s1") == before {
+		t.Error("a session settled on a failed read is never read again, so its last usage is lost")
+	}
+}
+
+// A session that comes back is live again, and its second ending deserves the
+// same final read as its first.
+func TestResumedSessionIsSettledAgainOnItsSecondEnding(t *testing.T) {
+	ctx := context.Background()
+	d := inmem.NewDiscoverer()
+	d.SetSessions(live("s1"))
+
+	reader := newControllableReader()
+	composer, reg := wireWith(d, reader)
+
+	reg.Refresh(ctx)
+	composer.Refresh(ctx)
+
+	// It ends, and is settled.
+	d.SetSessions(nil)
+	reg.Refresh(ctx)
+	composer.Refresh(ctx)
+	settled := reader.readCount("s1")
+
+	// Settling has to hold while it stays gone.
+	composer.Refresh(ctx)
+	if reader.readCount("s1") != settled {
+		t.Fatal("a settled session must not be re-read on every pass")
+	}
+
+	// claude --resume: the same session appears again.
+	d.SetSessions(live("s1"))
+	reg.Refresh(ctx)
+	composer.Refresh(ctx)
+
+	// And ends a second time.
+	d.SetSessions(nil)
+	reg.Refresh(ctx)
+	resumed := reader.readCount("s1")
+	composer.Refresh(ctx)
+
+	if reader.readCount("s1") == resumed {
+		t.Error("the second ending skipped its final read: settling was never cleared when the session came back")
+	}
+}
+
+// A session the accountant has no record of is one whose usage could not be
+// read. Rendering that as $0.00 is a plausible wrong number, which is the one
+// outcome the whole design is built to avoid.
+func TestSessionWithNoAccountingIsNotShownAsFree(t *testing.T) {
+	ctx := context.Background()
+	d := inmem.NewDiscoverer()
+	d.SetSessions(live("s1"))
+
+	reader := newControllableReader()
+	reader.setFail(true)
+	composer, reg := wireWith(d, reader)
+
+	reg.Refresh(ctx)
+	composer.Refresh(ctx)
+
+	rows := composer.Snapshot().Rows
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if amount, known := rows[0].Cost.Amount(); known {
+		t.Errorf("cost = $%.2f (known), want unknown: an unreadable session must not read as free", amount)
+	}
+	if got := rows[0].Cost.String(); got != "—" {
+		t.Errorf("cost renders as %q, want an em dash", got)
+	}
+}
+
+// The row and the total have to agree. A session with no accounting renders as
+// an em dash; a fleet total that quietly leaves it out while printing a
+// confident figure is the two halves of the screen contradicting each other.
+func TestFleetTotalAdmitsSessionsItCouldNotAccountFor(t *testing.T) {
+	ctx := context.Background()
+	d := inmem.NewDiscoverer()
+	d.SetSessions(live("s1"))
+
+	reader := newControllableReader()
+	reader.setFail(true)
+	composer, reg := wireWith(d, reader)
+
+	reg.Refresh(ctx)
+	composer.Refresh(ctx)
+
+	snap := composer.Snapshot()
+	if _, known := snap.Fleet.Cost.Amount(); !known {
+		t.Error("the fleet total went unknown rather than reporting what it is missing")
+	}
+	if !snap.Fleet.Partial() {
+		t.Error("a total missing a whole session must be flagged as partial")
+	}
+	if snap.Fleet.Unrecorded != 1 {
+		t.Errorf("unrecorded = %d, want 1", snap.Fleet.Unrecorded)
+	}
+
+	// Once the session can be read, the total becomes a real figure again.
+	reader.setFail(false)
+	composer.Refresh(ctx)
+
+	snap = composer.Snapshot()
+	if amount, known := snap.Fleet.Cost.Amount(); !known || amount <= 0 {
+		t.Errorf("fleet total = %v (known=%v), want a positive figure once the session is accounted for", amount, known)
+	}
+	if snap.Fleet.Partial() {
+		t.Error("a fully accounted fleet must not be flagged as partial")
+	}
+}
+
+// A failed final read is retried, but not forever: the registry never drops a
+// session, and a transcript that was deleted never becomes readable, so each
+// pass would otherwise walk every project directory looking for it again.
+//
+// The bound is wall-clock time rather than a count of passes, because the
+// reader answers most passes from its own memory of the failed search without
+// going to look — so a budget of attempts would be spent in seconds without the
+// transcript having had any real chance to appear.
+func TestFinalReadRetriesAreBoundedByTime(t *testing.T) {
+	ctx := context.Background()
+	d := inmem.NewDiscoverer()
+	d.SetSessions(live("s1"))
+
+	now := time.Now()
+	reader := newControllableReader()
+	reg := registry.New(d, inmem.BranchResolver{})
+	composer := app.New(reg, cost.New(cost.NewRateTable(), reader, nil),
+		app.WithClock(func() time.Time { return now }))
+
+	reg.Refresh(ctx)
+	composer.Refresh(ctx)
+
+	// It ends, and its transcript can never be read again.
+	d.SetSessions(nil)
+	reg.Refresh(ctx)
+	reader.setFail(true)
+
+	// Many passes inside the grace: the session is still worth chasing, because
+	// a transcript that is merely late has not had time to appear.
+	for i := 0; i < 20; i++ {
+		composer.Refresh(ctx)
+	}
+	// Twenty passes inside the grace means twenty attempts: a budget spent
+	// after two or three would be gone before a late transcript could appear.
+	if got := reader.failCount("s1"); got < 20 {
+		t.Errorf("chased %d times over 20 passes inside the grace; a late transcript is given up on too early", got)
+	}
+
+	// Past the grace it is settled, and chasing stops for good.
+	now = now.Add(2 * time.Hour)
+	composer.Refresh(ctx)
+	settled := reader.failCount("s1")
+
+	for i := 0; i < 20; i++ {
+		composer.Refresh(ctx)
+	}
+	if got := reader.failCount("s1"); got != settled {
+		t.Errorf("an unreadable ended session was chased %d more times after the grace expired", got-settled)
 	}
 }

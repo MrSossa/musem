@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/MrSossa/musem"
@@ -291,5 +292,170 @@ func TestRowsWrittenBeforeCursorsResumeAtTheEnd(t *testing.T) {
 	}
 	if got.Cursor != "end" {
 		t.Errorf("Cursor = %q, want %q so the row is not counted a second time", got.Cursor, "end")
+	}
+}
+
+// The accumulated dollars have to outlive the process independently of the
+// reported cost. A session that met an unpriceable model reports an unknown
+// cost, and if only that is stored it resumes from nothing.
+func TestPricedDollarsSurviveARestartWhileTheCostIsUnknown(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "musem.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	want := musem.SessionCost{
+		SessionID:     "s1",
+		Usage:         musem.Usage{InputTokens: 10, OutputTokens: 20},
+		Cost:          musem.UnknownCost(),
+		Priced:        4.25,
+		UnknownModels: []string{"claude-from-the-future"},
+		Cursor:        "128",
+	}
+	if err := s.Save(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := s.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := loaded["s1"]
+	if !ok {
+		t.Fatal("session was not persisted")
+	}
+	if got.Cost.Known() {
+		t.Error("an unknown cost must load as unknown")
+	}
+	if got.Priced != want.Priced {
+		t.Errorf("priced dollars = %v, want %v: the accumulator did not survive the restart", got.Priced, want.Priced)
+	}
+}
+
+// A migration and the record that it ran must commit together. If they do not,
+// a process dying between them leaves a schema that has moved on and a version
+// that has not — and the next start replays an ALTER whose column already
+// exists, failing then and on every start afterwards, taking the user's entire
+// cost history with it.
+//
+// The interruption is simulated rather than waited for: a migration that drops
+// the version table makes the INSERT after it fail, which is the same ordering
+// a crash produces.
+func TestMigrationAndItsVersionCommitTogether(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "musem.db")
+
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(ctx, musem.SessionCost{SessionID: "s1", Cost: musem.USD(7), Priced: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	original := migrations
+	t.Cleanup(func() { migrations = original })
+
+	// The DDL succeeds and the version bump that should follow it cannot.
+	migrations = append(append([]string(nil), original...), `DROP TABLE schema_version`)
+
+	if _, err := Open(ctx, path); err == nil {
+		t.Fatal("a migration whose version could not be recorded must fail the open")
+	}
+
+	// Rolled back as one, so the database is exactly where it was: the next
+	// start resumes at the right migration instead of replaying from zero.
+	migrations = original
+	s, err = Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopening after an interrupted migration: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	var version int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != len(original) {
+		t.Errorf("schema version = %d, want %d", version, len(original))
+	}
+
+	loaded, err := s.Load(ctx)
+	if err != nil {
+		t.Fatalf("history after recovery: %v", err)
+	}
+	if got, ok := loaded["s1"]; !ok || got.Priced != 7 {
+		t.Errorf("history = %+v, want the session preserved with its accumulated dollars", loaded)
+	}
+}
+
+// Two musem processes starting together must both come up with history intact.
+// Reading the schema version once, outside the migrations, lets both see the
+// same number and both apply the next one: the loser's ALTER hits a column that
+// already exists, its Open fails, and it runs with history disabled — silently
+// forgetting every session's cost for that run.
+func TestConcurrentOpensAllMigrateCleanly(t *testing.T) {
+	ctx := context.Background()
+
+	for round := 0; round < 10; round++ {
+		path := filepath.Join(t.TempDir(), "musem.db")
+
+		// A barrier, so the openers actually overlap rather than queueing behind
+		// whichever one happened to start first.
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		errs := make([]error, 8)
+
+		for i := range errs {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				s, err := Open(ctx, path)
+				errs[i] = err
+				if s != nil {
+					_ = s.Close()
+				}
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d, opener %d: %v", round, i, err)
+			}
+		}
+
+		// And the database is left at exactly one copy of the schema.
+		s, err := Open(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var version int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		if version != len(migrations) {
+			t.Errorf("round %d: schema version = %d, want %d", round, version, len(migrations))
+		}
+		var rows int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_version`).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		if rows != len(migrations) {
+			t.Errorf("round %d: %d version rows for %d migrations; a migration ran twice",
+				round, rows, len(migrations))
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
