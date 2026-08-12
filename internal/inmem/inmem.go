@@ -2,10 +2,14 @@
 // and demonstrated without live agents running.
 //
 // It exists for a practical reason: the interesting states — a session waiting
-// on the user, one that died, one whose data went stale — are awkward to
-// reproduce on demand with real agents, and a UI that can only be exercised
-// against whatever happens to be running is a UI whose edge cases never get
-// looked at.
+// on the user, one that died, one whose status could not be determined — are
+// awkward to reproduce on demand with real agents, and a UI that can only be
+// exercised against whatever happens to be running is a UI whose edge cases
+// never get looked at.
+//
+// Staleness is not among them, and cannot be: it is a property of the refresh
+// rather than of any row here, so the way to reach it is to set Err and make
+// Discover fail. See the note on inmem-0004.
 package inmem
 
 import (
@@ -50,11 +54,18 @@ func NewDiscoverer() *Discoverer {
 			PID: 1003, Started: now.Add(-3 * time.Hour), LastSeen: now,
 		},
 		{
-			// Stale on purpose: LastSeen is old, so the UI must show it as such
-			// rather than presenting it like a current reading.
+			// Indeterminate on purpose. It is the status hardest to catch in the
+			// wild and the one most easily got wrong, because the honest "I don't
+			// know" has to survive all the way to the screen rather than being
+			// rounded down to idle somewhere in between.
+			//
+			// LastSeen is current, like every other session here: the registry
+			// stamps it at the moment it folds a session in, so a fabricated one
+			// would be overwritten on the first refresh. Staleness is a property
+			// of the refresh, not of a row — drive it by making Discover fail.
 			ID: "inmem-0004", Name: "worker", Dir: "/home/dev/projects/worker",
 			Branch: "fix/retry", Status: musem.StatusIndeterminate,
-			PID: 1004, Started: now.Add(-90 * time.Minute), LastSeen: now.Add(-4 * time.Minute),
+			PID: 1004, Started: now.Add(-90 * time.Minute), LastSeen: now,
 		},
 		{
 			ID: "inmem-0005", Name: "spike", Dir: "/home/dev/projects/spike",

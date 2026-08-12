@@ -109,15 +109,13 @@ func (s *Session) Validate() error {
 	return nil
 }
 
-// StaleAfter reports whether the session's data is older than d as of now. Data
-// freshness is a fact about the data, decided here; how staleness is signalled
-// on screen is a separate, presentational decision.
-func (s *Session) StaleAfter(now time.Time, d time.Duration) bool {
-	if s.LastSeen.IsZero() {
-		return true
-	}
-	return now.Sub(s.LastSeen) > d
-}
+// Freshness is tracked per refresh rather than per session, and deliberately.
+// Discovery answers for the whole inventory in one call: it either listed the
+// sessions or it did not, so every session in a snapshot is exactly as old as
+// the pass that produced it. A per-session StaleAfter used to live here and had
+// no caller it could ever serve — the registry stamps LastSeen at the moment it
+// folds a session in, so the value could only ever be the age of the refresh,
+// reported once per row. See registry.Snapshot.Age.
 
 // Usage is the token consumption recorded for a session, taken verbatim from
 // what the agent tool wrote.

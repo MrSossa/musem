@@ -49,9 +49,20 @@ type Snapshot struct {
 	Rows  []Row
 	Fleet cost.Fleet
 
-	// Stale, ErrCode and ErrMessage carry the registry's honesty about its own
-	// data: how old it is and why, if the last refresh failed.
+	// Stale, StaleFor, ErrCode and ErrMessage carry the registry's honesty about
+	// its own data: how old it is and why, if the last refresh failed.
+	//
+	// StaleFor is how long ago the data was refreshed, and is carried rather than
+	// left to be recomputed from a timestamp. Marking data stale without saying
+	// since when tells the user their figures are wrong but not how wrong: a
+	// dashboard three seconds behind and one abandoned an hour ago look
+	// identical, and only one of them is worth acting on.
+	//
+	// It is only meaningful beside Stale, and is zero whenever Stale is false as
+	// well as when no refresh has ever completed — so a zero on a stale snapshot
+	// means "never refreshed", which the view reports as its own case.
 	Stale      bool
+	StaleFor   time.Duration
 	ErrCode    string
 	ErrMessage string
 }
@@ -150,6 +161,7 @@ func (c *Composer) Snapshot() Snapshot {
 		Rows:       rows,
 		Fleet:      c.accountant.Total(ids),
 		Stale:      inventory.Stale,
+		StaleFor:   inventory.Age,
 		ErrCode:    inventory.ErrCode,
 		ErrMessage: inventory.ErrMessage,
 	}

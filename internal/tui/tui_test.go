@@ -80,6 +80,56 @@ func TestStaleDataIsMarked(t *testing.T) {
 	}
 }
 
+// The spec requires the marker to say since when. "Stale" alone tells the user
+// their figures are wrong without telling them how wrong.
+func TestStaleMarkerSaysHowOldTheDataIs(t *testing.T) {
+	tests := []struct {
+		name string
+		age  time.Duration
+		want string
+	}{
+		{"seconds", 42 * time.Second, "42s ago"},
+		{"minutes", 9 * time.Minute, "9m ago"},
+		{"hours", 3 * time.Hour, "3h ago"},
+		// Under a second is still an age. "0s ago" would read as a claim that
+		// the data is current, which is what the line exists to deny.
+		{"sub-second", 200 * time.Millisecond, "1s ago"},
+		// Just short of the next unit stays in this one. Rounding would print
+		// "60s" and "60m", which name the next unit up in the units of the one
+		// below.
+		{"just under a minute", 59700 * time.Millisecond, "59s ago"},
+		{"just under an hour", 59*time.Minute + 40*time.Second, "59m ago"},
+		{"just under a day", 23*time.Hour + 50*time.Minute, "23h ago"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := snapshot(row("a", "api", musem.StatusIdle))
+			s.Stale, s.StaleFor = true, tt.age
+
+			view := stripANSI(withSnapshot(NewModel(), s).View())
+			if !strings.Contains(view, tt.want) {
+				t.Errorf("stale marker should contain %q, got:\n%s", tt.want, view)
+			}
+		})
+	}
+}
+
+// A snapshot that has never refreshed is a different statement from one that
+// has fallen behind, and must not be reported as "0s ago".
+func TestStaleMarkerBeforeAnyRefresh(t *testing.T) {
+	s := snapshot()
+	s.Stale, s.StaleFor = true, 0
+
+	view := stripANSI(withSnapshot(NewModel(), s).View())
+	if !strings.Contains(view, "no refresh has completed yet") {
+		t.Errorf("a never-refreshed snapshot must say so, got:\n%s", view)
+	}
+	if strings.Contains(view, "ago") {
+		t.Errorf("no age should be claimed before the first refresh, got:\n%s", view)
+	}
+}
+
 // An error code becomes an actionable sentence here, not in the adapter.
 func TestErrorCodeIsRenderedAsGuidance(t *testing.T) {
 	s := snapshot()

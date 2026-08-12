@@ -65,6 +65,21 @@ type Snapshot struct {
 	// the best that is known — but it must never look current.
 	Stale bool
 
+	// Age is how long ago the data was refreshed, and is only meaningful beside
+	// Stale. It is set when Stale is true and a refresh has completed, and is
+	// zero otherwise — both for fresh data, where the age is nobody's business
+	// because the figures are current, and before the first refresh, where there
+	// is no age to report and inventing one from a zero timestamp would claim
+	// the data is decades old rather than absent. Read it only where Stale is,
+	// and treat a zero on a stale snapshot as "never refreshed".
+	//
+	// It is derived here rather than left to the reader to compute from
+	// UpdatedAt: Stale is decided by this same clock in this same call, and a
+	// caller subtracting its own now from UpdatedAt could report an age that
+	// contradicts the flag beside it. Saying how old the data is, and not only
+	// that it is old, is what the interface needs to be honest about it.
+	Age time.Duration
+
 	// ErrCode and ErrMessage describe why the last refresh failed, empty when
 	// it succeeded. Carried as an application code so the UI decides the
 	// presentation and the adapter never has to.
@@ -362,8 +377,12 @@ func (r *Registry) Snapshot() Snapshot {
 		snap.ErrCode = musem.ErrorCode(r.lastErr)
 		snap.ErrMessage = musem.ErrorMessage(r.lastErr)
 	}
-	if r.updatedAt.IsZero() || r.now().Sub(r.updatedAt) > r.staleness {
+	// One reading of the clock decides both the flag and the age, so the two can
+	// never disagree about the same snapshot.
+	if r.updatedAt.IsZero() {
 		snap.Stale = true
+	} else if age := r.now().Sub(r.updatedAt); age > r.staleness {
+		snap.Stale, snap.Age = true, age
 	}
 
 	return snap

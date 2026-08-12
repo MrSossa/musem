@@ -221,6 +221,45 @@ func TestSnapshotGoesStale(t *testing.T) {
 	}
 }
 
+// A stale snapshot says how stale. Marking data old without saying how old
+// leaves the user unable to tell a dashboard a moment behind from one that
+// stopped refreshing an hour ago, and only one of those is worth acting on.
+func TestStaleSnapshotReportsItsAge(t *testing.T) {
+	now := time.Now()
+	clock := func() time.Time { return now }
+
+	d := &fakeDiscoverer{sessions: []musem.Session{session("a", "alpha", "/p/alpha", musem.StatusIdle)}}
+	r := New(d, fakeBranches{}, WithStaleness(10*time.Second), WithClock(func() time.Time { return clock() }))
+
+	r.Refresh(context.Background())
+	if got := r.Snapshot().Age; got != 0 {
+		t.Errorf("fresh data reports no age, got %s", got)
+	}
+
+	now = now.Add(90 * time.Second)
+	snap := r.Snapshot()
+	if !snap.Stale {
+		t.Fatal("data past the staleness window must be flagged")
+	}
+	if got, want := snap.Age, 90*time.Second; got != want {
+		t.Errorf("Age = %s, want %s", got, want)
+	}
+}
+
+// Before any refresh has completed there is no age to report, and inventing one
+// from a zero timestamp would claim the data is decades old rather than absent.
+func TestSnapshotBeforeAnyRefreshIsStaleWithNoAge(t *testing.T) {
+	r := New(&fakeDiscoverer{}, fakeBranches{})
+
+	snap := r.Snapshot()
+	if !snap.Stale {
+		t.Error("data that has never been refreshed is stale")
+	}
+	if snap.Age != 0 {
+		t.Errorf("Age = %s, want zero when nothing has ever refreshed", snap.Age)
+	}
+}
+
 // Waiting sessions come first: they are the ones blocked on a human.
 func TestWaitingSessionsSortFirst(t *testing.T) {
 	d := &fakeDiscoverer{sessions: []musem.Session{

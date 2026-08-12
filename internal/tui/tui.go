@@ -144,6 +144,41 @@ func errorMessage(code, message string) string {
 	}
 }
 
+// staleNotice says that the data is old and how old it is.
+//
+// The age is the point of the line. "Stale" on its own tells the user their
+// figures are wrong without telling them how far wrong, so a dashboard three
+// seconds behind reads exactly like one abandoned an hour ago — and they call
+// for entirely different reactions. A zero age means no refresh has ever
+// completed, which is a different statement from a refresh that has fallen
+// behind, and is worded as one.
+func staleNotice(age time.Duration) string {
+	if age <= 0 {
+		return "  ⚠ data is stale — no refresh has completed yet"
+	}
+	return "  ⚠ data is stale — last refreshed " + humanAge(age) + " ago"
+}
+
+// humanAge renders a duration at the coarsest unit that still says something,
+// because the exact second stopped mattering once the figure went stale.
+//
+// Truncated rather than rounded, so a figure always stays inside the unit it is
+// labelled with. Rounding pushes 59.7s to "60s" and 59m40s to "60m", which name
+// the next unit up in the units of the one below and read as arithmetic nobody
+// finished. The floor at 1 is the other end of the same rule: an age below a
+// second is still an age, and "0s ago" reads as a claim that the data is current
+// — the one thing this line exists to deny.
+func humanAge(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", maxInt(1, int(d.Seconds())))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	}
+}
+
 // column describes one table column and how readily it is dropped when the
 // terminal is too narrow. Higher priority survives longer.
 type column struct {
@@ -400,7 +435,7 @@ func (m Model) renderHeader(width int) string {
 	b.WriteString("\n")
 
 	if m.snapshot.Stale {
-		b.WriteString(styleStale.Render(padWide("  ⚠ data is stale — the last refresh did not complete", width)))
+		b.WriteString(styleStale.Render(padWide(staleNotice(m.snapshot.StaleFor), width)))
 		b.WriteString("\n")
 	}
 	if msg := errorMessage(m.snapshot.ErrCode, m.snapshot.ErrMessage); msg != "" {
