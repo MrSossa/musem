@@ -67,7 +67,7 @@ func (r *BranchResolver) Branch(ctx context.Context, dir string) (string, error)
 	// timeout exists to protect.
 	cmd.WaitDelay = time.Second
 
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Run(); err != nil && !answeredBeforeItsChildLetGo(cmd, err, stdout.String()) {
 		// Distinguish "git is not installed" from "this is not a repository".
 		// The first is worth telling the user about; the second is routine.
 		var notFound *exec.Error
@@ -99,4 +99,24 @@ func (r *BranchResolver) Branch(ctx context.Context, dir string) (string, error)
 		return "", nil
 	}
 	return branch, nil
+}
+
+// answeredBeforeItsChildLetGo reports that git did the job and only the plumbing
+// outlived it.
+//
+// WaitDelay closes the pipes when the process that holds their write end is not
+// the one that was waited on — an fsmonitor daemon, a background maintenance
+// run, anything git forks and detaches — and Run then reports ErrWaitDelay for a
+// git that exited zero. Taking that as a failure discards the name already
+// sitting in stdout and blanks the BRANCH column of every repository whose git
+// leaves a process behind, once per refresh and for as long as it does.
+//
+// The trailing newline is what separates a complete answer from a pipe cut
+// mid-word. git terminates the name with one, so output without it is a
+// fragment — and a fragment shown as a branch is precisely the confident wrong
+// label this resolver exists to refuse.
+func answeredBeforeItsChildLetGo(cmd *exec.Cmd, err error, out string) bool {
+	return errors.Is(err, exec.ErrWaitDelay) &&
+		cmd.ProcessState != nil && cmd.ProcessState.Success() &&
+		strings.HasSuffix(out, "\n")
 }

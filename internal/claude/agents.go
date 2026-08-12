@@ -76,7 +76,7 @@ func (d *Discoverer) Discover(ctx context.Context) ([]musem.Session, error) {
 	// timeout exists to protect.
 	cmd.WaitDelay = time.Second
 
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Run(); err != nil && !answeredBeforeItsChildLetGo(cmd, err) {
 		var notFound *exec.Error
 		if errors.As(err, &notFound) {
 			return nil, musem.Wrap(err, musem.EUNAVAILABLE,
@@ -99,6 +99,23 @@ func (d *Discoverer) Discover(ctx context.Context) ([]musem.Session, error) {
 	}
 
 	return parseAgents(stdout.Bytes())
+}
+
+// answeredBeforeItsChildLetGo reports that the CLI did the job and only the
+// plumbing outlived it.
+//
+// WaitDelay closes the pipes when the process holding their write end is not the
+// one that was waited on — a hook, a helper, anything the CLI forks and detaches
+// — and Run then reports ErrWaitDelay for a command that exited zero. Taking
+// that as a failure throws away a session list that was captured in full and
+// puts an error banner over stale rows, every refresh, for a call that worked.
+//
+// Nothing is assumed about the payload. Output the closing pipe cut short is not
+// valid JSON, so it fails in the parser as unparseable — which is the accurate
+// complaint, and a different one from the CLI having failed.
+func answeredBeforeItsChildLetGo(cmd *exec.Cmd, err error) bool {
+	return errors.Is(err, exec.ErrWaitDelay) &&
+		cmd.ProcessState != nil && cmd.ProcessState.Success()
 }
 
 // firstLine returns the first non-empty line of s, bounded so a CLI that writes

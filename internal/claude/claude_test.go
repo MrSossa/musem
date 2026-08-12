@@ -850,6 +850,33 @@ func TestDiscoveryFailureCarriesTheCLIExplanation(t *testing.T) {
 	}
 }
 
+// The delay that keeps a stranded grandchild from wedging the refresh loop also
+// reports a CLI that did its job. The list was captured in full and the process
+// exited zero; only something it forked and detached still held the pipe.
+// Calling that a failure puts an error banner over stale rows on every refresh,
+// for a call that worked every time.
+func TestSessionsSurviveAChildThatOutlivesTheCLI(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stub relies on a POSIX shell")
+	}
+	bin := filepath.Join(t.TempDir(), "claude")
+	// Answers, then leaves a grandchild holding stdout open. The timeout is long
+	// enough that nothing here is a timeout: what ends the call is WaitDelay.
+	script := "#!/bin/sh\necho '[{\"sessionId\":\"s1\",\"name\":\"api\"}]'\nsleep 30 &\nexit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Discoverer{Bin: bin, Timeout: 30 * time.Second}
+	sessions, err := d.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("err = %v, want nil: the CLI answered, and only its child outlived it", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != "s1" {
+		t.Errorf("sessions = %+v, want the one the CLI listed", sessions)
+	}
+}
+
 // A transcript too short to fingerprint mints a cursor that cannot prove which
 // file it came from. Resuming into a replacement on the strength of it skips
 // everything before the offset and adds the rest to another file's totals.

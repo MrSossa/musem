@@ -107,3 +107,41 @@ func TestATimedOutLookupReturnsEvenWhenAChildHoldsThePipe(t *testing.T) {
 		t.Fatal("Branch never returned: a wedged grandchild holds the refresh loop open indefinitely")
 	}
 }
+
+// The delay that keeps a stranded grandchild from wedging the refresh loop also
+// reports a git that did its job. git answered and exited zero; only a process
+// it forked and detached — an fsmonitor daemon, a background maintenance run —
+// still held the pipe. Calling that a failure throws away the name already
+// captured and blanks the BRANCH column of every such repository, once a
+// refresh, for as long as it keeps doing it.
+func TestABranchSurvivesAChildThatOutlivesGit(t *testing.T) {
+	// Answers, then leaves a grandchild holding stdout open. The timeout is long
+	// enough that nothing here is a timeout: what ends the call is WaitDelay.
+	r := &BranchResolver{Bin: fakeGit(t, "echo main; sleep 30 & exit 0"), Timeout: 30 * time.Second}
+
+	branch, err := r.Branch(context.Background(), "/some/dir")
+	if err != nil {
+		t.Fatalf("err = %v, want nil: git answered, and only its child outlived it", err)
+	}
+	if branch != "main" {
+		t.Errorf("branch = %q, want %q", branch, "main")
+	}
+}
+
+// The same path must not promote a fragment. A pipe closed mid-word leaves
+// output git never finished writing, and a half-written name shown as a branch
+// is the confident wrong label this resolver exists to refuse — worse than
+// admitting it does not know.
+func TestATruncatedAnswerIsNotReportedAsABranch(t *testing.T) {
+	// No newline: git terminates the name with one, so this is what a cut looks
+	// like rather than what an answer looks like.
+	r := &BranchResolver{Bin: fakeGit(t, "printf part; sleep 30 & exit 0"), Timeout: 30 * time.Second}
+
+	branch, err := r.Branch(context.Background(), "/some/dir")
+	if err == nil {
+		t.Fatalf("branch = %q with no error; a fragment was promoted to a name", branch)
+	}
+	if branch != "" {
+		t.Errorf("branch = %q, want empty", branch)
+	}
+}
