@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -649,5 +650,55 @@ func TestUsageIsPricedAtTheTimeItWasIncurred(t *testing.T) {
 	rate, _ = table.LookupAt("claude-sonnet-5", time.Time{})
 	if rate.InputPerMTok != 3 {
 		t.Errorf("$%v per MTok for an undated record, want the current $3", rate.InputPerMTok)
+	}
+}
+
+// Set exists so a model released after this binary was built can be priced
+// without waiting for a new release, which means it can be called while the
+// refresh loop is already looking prices up. Run under -race, this is what
+// proves the table tolerates that rather than corrupting a read.
+func TestRateTableIsSafeUnderConcurrentUse(t *testing.T) {
+	table := NewRateTable()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for n := 0; n < 200; n++ {
+				table.Set("claude-late-arrival-"+strconv.Itoa(i), Rate{InputPerMTok: 1, OutputPerMTok: 2})
+			}
+		}(i)
+	}
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := 0; n < 200; n++ {
+				table.Lookup("claude-opus-5")
+				table.LookupAt("claude-sonnet-5", time.Time{})
+			}
+		}()
+	}
+	wg.Wait()
+
+	// The writes landed, and a rate added at runtime prices like any other.
+	rate, ok := table.Lookup("claude-late-arrival-0")
+	if !ok {
+		t.Fatal("a rate set at runtime must be findable")
+	}
+	if rate.InputPerMTok != 1 || rate.OutputPerMTok != 2 {
+		t.Errorf("rate = %+v, want the one that was set", rate)
+	}
+}
+
+// The zero table has no map, so Set has to be the thing that creates one rather
+// than panicking on a value nobody constructed.
+func TestZeroRateTableAcceptsARate(t *testing.T) {
+	var table RateTable
+	table.Set("claude-opus-5", Rate{InputPerMTok: 5, OutputPerMTok: 25})
+
+	if _, ok := table.Lookup("claude-opus-5"); !ok {
+		t.Error("a rate set on the zero table must be findable")
 	}
 }

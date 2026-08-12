@@ -102,9 +102,27 @@ func (a *Accountant) Update(ctx context.Context, sessionID string) error {
 	if len(reading.Entries) == 0 && reading.Skipped == 0 && reading.Cursor == cursor && !reading.Reset {
 		return nil
 	}
-	fresh := reading.Entries
 
+	sc := a.fold(sessionID, reading)
+
+	if a.store != nil {
+		return a.store.Save(ctx, sc)
+	}
+	return nil
+}
+
+// fold accumulates one reading into a session's running total and returns the
+// result, so the write it produces can be persisted outside the lock.
+//
+// It is its own method for the sake of the deferred unlock. Held across a body
+// this long, a lock released by a trailing statement is one panic away from
+// never being released at all — and this is the lock the UI takes on every
+// frame, so the failure would not be a crash but a dashboard frozen mid-draw
+// with no indication why.
+func (a *Accountant) fold(sessionID string, reading musem.UsageReading) musem.SessionCost {
 	a.mu.Lock()
+	defer a.mu.Unlock()
+
 	sc := a.costs[sessionID]
 	if reading.Reset {
 		// The source record was replaced or truncated and is being read from
@@ -128,7 +146,7 @@ func (a *Accountant) Update(ctx context.Context, sessionID string) error {
 	// the arithmetic for everything priced before or after it.
 	known := sc.Priced
 
-	for _, mu := range fresh {
+	for _, mu := range reading.Entries {
 		sc.Usage.Add(mu.Usage)
 
 		rate, ok := a.rates.LookupAt(mu.Model, mu.At)
@@ -156,12 +174,7 @@ func (a *Accountant) Update(ctx context.Context, sessionID string) error {
 	}
 
 	a.costs[sessionID] = sc
-	a.mu.Unlock()
-
-	if a.store != nil {
-		return a.store.Save(ctx, sc)
-	}
-	return nil
+	return sc
 }
 
 // Session returns the accounting for one session.

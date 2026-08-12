@@ -2,6 +2,7 @@ package cost
 
 import (
 	"regexp"
+	"sync"
 	"time"
 )
 
@@ -90,7 +91,14 @@ var defaultRates = map[string]Rate{
 var snapshotSuffix = regexp.MustCompile(`-\d{8}$`)
 
 // RateTable resolves a model identifier to its price.
+//
+// It is safe to use from several goroutines. Set exists so a model released
+// after this binary was built can be priced without waiting for a new release,
+// which means it can be called while the refresh loop is already looking prices
+// up — an unsynchronised map would make that a data race, and one that shows up
+// as a corrupted read rather than an honest failure.
 type RateTable struct {
+	mu    sync.RWMutex
 	rates map[string]Rate
 
 	// now decides which side of an introductory price's expiry we are on. It is
@@ -109,14 +117,24 @@ func NewRateTable() *RateTable {
 
 // SetClock replaces the clock used to resolve introductory pricing.
 func (t *RateTable) SetClock(now func() time.Time) {
-	if now != nil {
-		t.now = now
+	if now == nil {
+		return
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.now = now
 }
 
 // Set overrides or adds a rate, so a model released after this binary was built
 // can be priced without waiting for a new release.
-func (t *RateTable) Set(model string, rate Rate) { t.rates[model] = rate }
+func (t *RateTable) Set(model string, rate Rate) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.rates == nil {
+		t.rates = make(map[string]Rate)
+	}
+	t.rates[model] = rate
+}
 
 // Lookup returns the rate in effect for a model now, and whether one is known.
 func (t *RateTable) Lookup(model string) (Rate, bool) {
@@ -126,6 +144,9 @@ func (t *RateTable) Lookup(model string) (Rate, bool) {
 // LookupAt returns the rate that applied to a model at a given moment. A zero
 // moment means "whatever applies now", for a record that carried no timestamp.
 func (t *RateTable) LookupAt(model string, at time.Time) (Rate, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
 	rate, ok := t.rates[model]
 	if !ok {
 		// A dated snapshot is the same model as its undated name, and is priced
