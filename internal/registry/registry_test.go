@@ -386,3 +386,144 @@ func TestBranchCacheExpires(t *testing.T) {
 		t.Errorf("branch = %q after the TTL elapsed, want main", got)
 	}
 }
+
+// flakyBranches resolves a branch until it is told to fail, so a transient git
+// failure can be aimed at exactly the moment the cache expires.
+type flakyBranches struct {
+	branch string
+	fail   bool
+}
+
+func (f *flakyBranches) Branch(_ context.Context, _ string) (string, error) {
+	if f.fail {
+		return "", musem.Errorf(musem.EUNAVAILABLE, "git is busy")
+	}
+	return f.branch, nil
+}
+
+// The branch cache expires so a switched branch is noticed. When re-resolution
+// fails, the last known name has to survive: a git that was busy for a moment
+// must not blank a column the user reads.
+func TestExpiredBranchSurvivesAFailedRefresh(t *testing.T) {
+	ctx := context.Background()
+	d := &fakeDiscoverer{sessions: []musem.Session{
+		session("a", "alpha", "/p/alpha", musem.StatusIdle),
+	}}
+	branches := &flakyBranches{branch: "main"}
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	r := New(d, branches, WithBranchTTL(10*time.Second), WithClock(clock))
+
+	r.Refresh(ctx)
+	if got := r.Snapshot().Sessions[0].Branch; got != "main" {
+		t.Fatalf("branch = %q, want main", got)
+	}
+
+	// The entry expires and the lookup that would replace it fails.
+	now = now.Add(time.Minute)
+	branches.fail = true
+	r.Refresh(ctx)
+
+	if got := r.Snapshot().Sessions[0].Branch; got != "main" {
+		t.Errorf("branch = %q, want main: a transient failure blanked a branch that was known", got)
+	}
+
+	// Once git answers again the fresh name wins, including a different one.
+	branches.fail = false
+	branches.branch = "feat/x"
+	now = now.Add(time.Minute)
+	r.Refresh(ctx)
+
+	if got := r.Snapshot().Sessions[0].Branch; got != "feat/x" {
+		t.Errorf("branch = %q, want feat/x: a stale name outlived its replacement", got)
+	}
+}
+
+// Keeping a branch through a transient failure is right; keeping it forever is
+// not. Once the name is old enough that there is no reason left to believe it,
+// showing it as though it were current is the one thing musem must not do.
+func TestAStaleBranchIsEventuallyGivenUp(t *testing.T) {
+	ctx := context.Background()
+	d := &fakeDiscoverer{sessions: []musem.Session{
+		session("a", "alpha", "/p/alpha", musem.StatusIdle),
+	}}
+	branches := &flakyBranches{branch: "main"}
+
+	now := time.Now()
+	ttl := 10 * time.Second
+	r := New(d, branches, WithBranchTTL(ttl), WithClock(func() time.Time { return now }))
+
+	r.Refresh(ctx)
+	if got := r.Snapshot().Sessions[0].Branch; got != "main" {
+		t.Fatalf("branch = %q, want main", got)
+	}
+
+	// git stops answering for good.
+	branches.fail = true
+
+	// Just past the TTL the name survives: one slow call is noise.
+	now = now.Add(2 * ttl)
+	r.Refresh(ctx)
+	if got := r.Snapshot().Sessions[0].Branch; got != "main" {
+		t.Errorf("branch = %q just past the TTL, want main: a transient failure must not blank it", got)
+	}
+
+	// Far past it the name is no longer worth believing.
+	now = now.Add(ttl * branchStaleGrace)
+	r.Refresh(ctx)
+	if got := r.Snapshot().Sessions[0].Branch; got != "" {
+		t.Errorf("branch = %q long after resolution stopped working, want empty: a stale name was presented as current", got)
+	}
+}
+
+// An end the adapter reports itself is discovery stating a fact. The registry
+// infers ends of its own from a session no longer appearing, and only that
+// inference is withdrawn by seeing the session again.
+func TestAnAdapterReportedEndIsNotWipedByRediscovery(t *testing.T) {
+	ctx := context.Background()
+	ended := time.Now().Add(-time.Hour)
+	s := session("a", "alpha", "/p/alpha", musem.StatusDead)
+	s.EndedAt = &ended
+
+	d := &fakeDiscoverer{sessions: []musem.Session{s}}
+	r := New(d, fakeBranches{byDir: map[string]string{"/p/alpha": "main"}})
+
+	r.Refresh(ctx)
+	r.Refresh(ctx) // the second pass is where the end used to be wiped
+
+	got := r.Snapshot().Sessions[0]
+	if !got.Ended() {
+		t.Error("an end the adapter reported was discarded on rediscovery")
+	}
+}
+
+// Ended sessions are marked dead and never dropped, and dead outranks running.
+// Without ending sorting below everything live, an afternoon of short sessions
+// buries the one session actually working.
+func TestEndedSessionsSortBelowLiveOnes(t *testing.T) {
+	ctx := context.Background()
+	d := &fakeDiscoverer{sessions: []musem.Session{
+		session("live", "zzz-running", "/p/a", musem.StatusRunning),
+		session("gone", "aaa-doomed", "/p/b", musem.StatusIdle),
+	}}
+	r := New(d, fakeBranches{})
+
+	r.Refresh(ctx)
+
+	// The second session stops appearing, so the registry marks it dead.
+	d.sessions = []musem.Session{session("live", "zzz-running", "/p/a", musem.StatusRunning)}
+	r.Refresh(ctx)
+
+	sessions := r.Snapshot().Sessions
+	if len(sessions) != 2 {
+		t.Fatalf("got %d sessions, want 2", len(sessions))
+	}
+	if sessions[0].ID != "live" {
+		t.Errorf("first session is %q (%s); a session that has ended must not outrank a running one",
+			sessions[0].ID, sessions[0].Status)
+	}
+	if !sessions[1].Ended() {
+		t.Error("the ended session belongs at the bottom")
+	}
+}

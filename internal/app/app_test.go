@@ -61,7 +61,8 @@ func TestComposedSnapshotJoinsSessionsAndCost(t *testing.T) {
 	}
 }
 
-// The registry orders by urgency and the composer must not disturb it.
+// The registry orders live sessions by urgency and puts everything that has
+// ended below them; the composer must not disturb either part.
 func TestComposerPreservesUrgencyOrdering(t *testing.T) {
 	composer, _ := wire(t)
 	rows := composer.Snapshot().Rows
@@ -70,9 +71,16 @@ func TestComposerPreservesUrgencyOrdering(t *testing.T) {
 		t.Skip("not enough rows to check ordering")
 	}
 	for i := 1; i < len(rows); i++ {
-		if rows[i-1].Session.Status.Urgency() > rows[i].Session.Status.Urgency() {
+		prev, cur := rows[i-1].Session, rows[i].Session
+		if prev.Ended() && !cur.Ended() {
+			t.Fatalf("row %d has ended and sorts above row %d, which is still live", i-1, i)
+		}
+		if prev.Ended() != cur.Ended() {
+			continue
+		}
+		if prev.Status.Urgency() > cur.Status.Urgency() {
 			t.Fatalf("row %d (%s) sorts after row %d (%s)",
-				i-1, rows[i-1].Session.Status, i, rows[i].Session.Status)
+				i-1, prev.Status, i, cur.Status)
 		}
 	}
 	if rows[0].Session.Status != musem.StatusWaiting {

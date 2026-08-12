@@ -42,6 +42,16 @@ const (
 	// resolution shells out to git and the answer is a label, not a figure
 	// anyone acts on within the second.
 	DefaultBranchTTL = 10 * time.Second
+
+	// branchStaleGrace is how many expired lifetimes a branch may go on being
+	// shown while re-resolution keeps failing.
+	//
+	// It buys the difference between a git that is busy and a git that is gone.
+	// Within the grace the last known name survives a failure, because blanking
+	// a column over one slow call is noise; past it there is no longer reason to
+	// believe the name, and showing a stale value as though it were current is
+	// the one thing musem is built not to do.
+	branchStaleGrace = 10
 )
 
 // Snapshot is the inventory as of one moment, together with everything the UI
@@ -212,9 +222,13 @@ func (r *Registry) Refresh(ctx context.Context) {
 		s.Branch = branches[s.Dir]
 
 		if prev, ok := r.sessions[s.ID]; ok {
-			// A session that reappears is no longer ended, and it keeps the
-			// identity it had — a rename changes the label, not the session.
-			s.EndedAt = nil
+			// A session that reappears keeps the identity it had — a rename
+			// changes the label, not the session. Its end is whatever discovery
+			// just said, which for a session that came back is nothing: the
+			// mark below is this registry's inference, and being seen again is
+			// what withdraws it. An end the adapter reports itself survives,
+			// because that is discovery stating a fact rather than inferring
+			// one.
 			if s.Started.IsZero() {
 				s.Started = prev.Started
 			}
@@ -265,11 +279,21 @@ func (r *Registry) resolveBranches(ctx context.Context, sessions []musem.Session
 		if _, done := out[s.Dir]; done {
 			continue
 		}
-		if e, ok := r.branchByDir[s.Dir]; ok && now.Sub(e.resolvedAt) < r.branchTTL {
+		e, cached := r.branchByDir[s.Dir]
+		if cached && now.Sub(e.resolvedAt) < r.branchTTL {
 			out[s.Dir] = e.branch
 			continue
 		}
-		out[s.Dir] = ""
+		// An expired entry still seeds the result with the name it held, so a
+		// git that was busy for a moment does not blank a column the user
+		// reads. That grace is bounded: past it the name is old enough that
+		// showing it as though it were current would be the worse lie, and an
+		// empty branch at least admits ignorance.
+		if now.Sub(e.resolvedAt) < r.branchTTL*branchStaleGrace {
+			out[s.Dir] = e.branch
+		} else {
+			out[s.Dir] = ""
+		}
 		missing = append(missing, s.Dir)
 	}
 	r.mu.RUnlock()
@@ -314,6 +338,15 @@ func (r *Registry) Snapshot() Snapshot {
 	}
 	sort.Slice(sessions, func(i, j int) bool {
 		a, b := sessions[i], sessions[j]
+		// A session that has ended sorts below every live one, whatever its
+		// status says. Ended sessions are marked dead and never dropped, and
+		// dead outranks running — so without this, an afternoon of short
+		// sessions buries the one session actually working behind a wall of
+		// finished ones. Nothing that has stopped is competing for attention
+		// with something that has not.
+		if a.Ended() != b.Ended() {
+			return b.Ended()
+		}
 		if a.Status.Urgency() != b.Status.Urgency() {
 			return a.Status.Urgency() < b.Status.Urgency()
 		}
