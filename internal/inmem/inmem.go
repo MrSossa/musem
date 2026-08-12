@@ -91,6 +91,23 @@ type BranchResolver struct {
 	Branches map[string]string
 }
 
+// NewBranchResolver returns a resolver that answers for the fabricated
+// sessions' directories.
+//
+// The registry overwrites every session's branch with what the resolver says,
+// so a resolver that knows nothing blanks the BRANCH column for every fake
+// session — leaving the fake adapter unable to exercise the one thing it exists
+// to exercise.
+func NewBranchResolver() BranchResolver {
+	branches := make(map[string]string)
+	for _, s := range NewDiscoverer().sessions {
+		if s.Dir != "" && s.Branch != "" {
+			branches[s.Dir] = s.Branch
+		}
+	}
+	return BranchResolver{Branches: branches}
+}
+
 // Branch returns the configured branch for dir, or empty when there is none —
 // which is the same answer a directory outside a repository gets, and is not an
 // error.

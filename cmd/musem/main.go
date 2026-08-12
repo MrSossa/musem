@@ -66,7 +66,7 @@ func run(fake bool, interval time.Duration) error {
 	if fake {
 		fakeDiscoverer := inmem.NewDiscoverer()
 		discoverer = fakeDiscoverer
-		branches = inmem.BranchResolver{}
+		branches = inmem.NewBranchResolver()
 		usage = inmem.NewUsageReader()
 	} else {
 		discoverer = claude.NewDiscoverer()
@@ -75,13 +75,19 @@ func run(fake bool, interval time.Duration) error {
 	}
 
 	// History is optional: without it musem still works, it just forgets. That
-	// is a better outcome than refusing to start over a database problem.
+	// is a better outcome than refusing to start over a database problem — but
+	// forgetting silently is not. Every restart would reset every session's
+	// cost to zero with nothing on screen or on stderr to explain why, and a
+	// read-only config directory would look exactly like a fresh install.
 	var store cost.HistoryStore
-	if path, err := sqlite.DefaultPath(); err == nil {
-		if s, err := sqlite.Open(ctx, path); err == nil {
-			defer func() { _ = s.Close() }()
-			store = s
-		}
+	path, err := sqlite.DefaultPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "musem: history is disabled: %s\n", musem.ErrorMessage(err))
+	} else if s, err := sqlite.Open(ctx, path); err != nil {
+		fmt.Fprintf(os.Stderr, "musem: history is disabled: %s\n", musem.ErrorMessage(err))
+	} else {
+		defer func() { _ = s.Close() }()
+		store = s
 	}
 
 	accountant := cost.New(cost.NewRateTable(), usage, store)
@@ -99,11 +105,44 @@ func run(fake bool, interval time.Duration) error {
 	snapshots := make(chan registry.Snapshot, 1)
 	go reg.Run(ctx, snapshots)
 	go drain(ctx, snapshots)
-	go tui.Pump(ctx, program, composer, interval)
 
-	_, err := program.Run()
-	return shutdownError(err, ctx.Err())
+	quit := make(chan struct{})
+	pumped := make(chan struct{})
+	go func() {
+		defer close(pumped)
+		tui.Pump(ctx, program, composer, interval, quit)
+	}()
+
+	_, err = program.Run()
+
+	// Captured before stop(), which makes ctx.Err() non-nil unconditionally and
+	// would otherwise make every genuine kill look like an orderly shutdown.
+	cause := ctx.Err()
+
+	// The store is closed by a defer registered above, so it closes when this
+	// function returns — after everything here. Waiting for the pump is what
+	// keeps it from writing to a database that has already gone: a Save landing
+	// in that gap fails, and its error is deliberately discarded upstream, so
+	// the loss would be silent.
+	//
+	// The pump is asked to stop before ctx is cancelled, not by cancelling it.
+	// Cancelling is what the in-flight write is handed, so doing it first would
+	// fail the very write this wait exists to let finish.
+	close(quit)
+	select {
+	case <-pumped:
+	case <-time.After(shutdownGrace):
+		// A pump wedged in I/O must not hold the terminal hostage. Closing the
+		// store under it risks one failed write, which is the lesser harm.
+	}
+	stop()
+
+	return shutdownError(err, cause)
 }
+
+// shutdownGrace bounds how long musem waits for the refresh loop to notice it
+// has been cancelled.
+const shutdownGrace = 2 * time.Second
 
 // shutdownError decides whether the UI loop stopping was a failure.
 //

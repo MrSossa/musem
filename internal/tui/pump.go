@@ -18,7 +18,13 @@ type SnapshotSource interface {
 // Pump is the only bridge between the goroutines that gather data and the UI
 // loop. Everything else is single-threaded by construction, so this is the only
 // place a data race can appear — and the only place to look when one does.
-func Pump(ctx context.Context, p *tea.Program, src SnapshotSource, interval time.Duration) {
+//
+// It stops on either ctx or quit, and the two mean different things. Closing
+// quit asks for no further passes while leaving ctx alive, so a refresh already
+// under way finishes and its writes land; cancelling ctx stops the work itself,
+// which is what a signal calls for. Having only the second would mean an
+// ordinary quit tore up whatever was mid-flight.
+func Pump(ctx context.Context, p *tea.Program, src SnapshotSource, interval time.Duration, quit <-chan struct{}) {
 	if interval <= 0 {
 		interval = time.Second
 	}
@@ -30,6 +36,8 @@ func Pump(ctx context.Context, p *tea.Program, src SnapshotSource, interval time
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-quit:
 			return
 		case <-time.After(interval):
 		}
