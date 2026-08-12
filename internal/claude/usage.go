@@ -70,7 +70,24 @@ func (r *UsageReader) ReadUsage(_ context.Context, sessionID, cursor string) (mu
 		return musem.UsageReading{}, err
 	}
 
-	return r.transcripts.ReadNew(path, cursor)
+	reading, err := r.transcripts.ReadNew(path, cursor)
+	if musem.ErrorCode(err) == musem.ENOTFOUND {
+		// The path resolved once but no longer exists: the transcript was
+		// deleted, or the session's directory was renamed, which moves the file
+		// because the tool encodes the working directory into its location.
+		// Forgetting the answer sends the next pass back to the search, where a
+		// genuine disappearance settles into the retry backoff. Keeping it would
+		// freeze the session's cost for the rest of the process.
+		r.forget(sessionID)
+	}
+	return reading, err
+}
+
+// forget drops a resolved path so the next read searches for it again.
+func (r *UsageReader) forget(sessionID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.paths, sessionID)
 }
 
 // resolve finds the transcript for a session, remembering the answer so the
@@ -84,9 +101,24 @@ func (r *UsageReader) resolve(sessionID string) (string, error) {
 	defer r.mu.Unlock()
 	r.init()
 
-	if path, ok := r.paths[sessionID]; ok {
-		return path, nil
+	if known, cached := r.paths[sessionID]; cached {
+		// Kept for as long as the file is there, and deliberately not re-chosen
+		// against the other candidates.
+		//
+		// Two transcripts can carry one session identifier — a renamed working
+		// directory leaves the old file on disk — and picking between them by
+		// modification time oscillates: anything that touches the loser (a
+		// backup, an editor, a copy) makes it the winner again. Every switch
+		// reads a file this reader has not seen from byte zero, which reports a
+		// restart, which wipes the session's accumulated total and its stored
+		// history. A figure that stops moving is recoverable; one that is
+		// destroyed on every flip is not.
+		if _, err := os.Stat(known); err == nil {
+			return known, nil
+		}
+		delete(r.paths, sessionID)
 	}
+
 	if until, ok := r.retry[sessionID]; ok && r.now().Before(until) {
 		return "", musem.Errorf(musem.ENOTFOUND, "no transcript found for session %s", sessionID)
 	}
@@ -109,9 +141,28 @@ func (r *UsageReader) resolve(sessionID string) (string, error) {
 		return "", musem.Errorf(musem.ENOTFOUND, "no transcript found for session %s", sessionID)
 	}
 
+	// Choosing happens once per session, so modification time is safe here in a
+	// way it is not on re-resolution: the live transcript is the one last
+	// written to, and taking the first match instead would pick by name.
+	best := newest(matches)
 	delete(r.retry, sessionID)
-	r.paths[sessionID] = matches[0]
-	return matches[0], nil
+	r.paths[sessionID] = best
+	return best, nil
+}
+
+// newest returns the most recently modified match.
+func newest(matches []string) string {
+	best, bestAt := matches[0], time.Time{}
+	for _, candidate := range matches {
+		info, err := os.Stat(candidate)
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(bestAt) {
+			best, bestAt = candidate, info.ModTime()
+		}
+	}
+	return best
 }
 
 func (r *UsageReader) retryAfter() time.Duration {

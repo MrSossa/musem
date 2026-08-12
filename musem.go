@@ -214,6 +214,15 @@ func (c Cost) String() string {
 type ModelUsage struct {
 	Model string
 	Usage Usage
+
+	// At is when the usage was recorded, zero when the source did not say.
+	//
+	// Prices change on a date, so what a record cost depends on when it was
+	// incurred and not on when musem got round to reading it. Without this a
+	// session that ran under an introductory rate and is first read after that
+	// rate expired is priced at the standard one — a confident figure that is
+	// wrong by the size of the discount.
+	At time.Time
 }
 
 // UsageReading is what one pass over a session's usage record yielded.
@@ -239,6 +248,16 @@ type UsageReading struct {
 	// understood. The usage they carried is gone, so a non-zero count means the
 	// figures beside it understate the truth and must say so.
 	Skipped int
+
+	// Reset reports that the source record was replaced or truncated, so this
+	// reading starts from its beginning rather than continuing from the cursor.
+	//
+	// It exists because the consumer accumulates. Re-reading a record from the
+	// start is only safe if whatever was already counted from it is discarded
+	// first; without this flag the reader cannot say "count these instead of"
+	// rather than "count these as well as", and a rotated transcript adds its
+	// whole history to a total that already contained it.
+	Reset bool
 }
 
 // SessionCost is the accounting for one session.
@@ -246,6 +265,14 @@ type SessionCost struct {
 	SessionID string
 	Usage     Usage
 	Cost      Cost
+
+	// Priced is the dollars accumulated so far from usage that had a known
+	// rate. It is kept as its own field rather than read back out of Cost:
+	// Cost is a reported figure that goes unknown the moment anything is
+	// unpriceable, and an unknown Cost yields no amount at all — so recovering
+	// the running total from it would destroy every dollar counted before the
+	// first unpriceable entry, permanently and persisted.
+	Priced float64
 
 	// UnknownModels lists models encountered with no known rate. When this is
 	// non-empty the tokens were still counted but Cost is unknown, and naming

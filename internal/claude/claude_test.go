@@ -4,8 +4,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/MrSossa/musem"
 )
@@ -299,8 +303,11 @@ func TestReadTranscriptResumesAcrossAPartialLine(t *testing.T) {
 	if len(first.Entries) != 1 {
 		t.Fatalf("got %d entries, want the 1 complete record", len(first.Entries))
 	}
-	if want := formatCursor(int64(len(complete))); first.Cursor != want {
-		t.Errorf("cursor = %q, want %q: the fragment must not count as consumed", first.Cursor, want)
+	// Asserted as a resolved offset rather than a literal string: the cursor's
+	// encoding is the reader's own business, the byte it resumes at is not.
+	if offset, _, ok := parseCursor(first.Cursor); !ok || offset != int64(len(complete)) {
+		t.Errorf("cursor %q resolves to offset %d, want %d: the fragment must not count as consumed",
+			first.Cursor, offset, len(complete))
 	}
 
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
@@ -377,8 +384,8 @@ func TestCursorEndCountsNothingAlreadyWritten(t *testing.T) {
 	if len(reading.Entries) != 0 {
 		t.Fatalf("got %d entries, want 0: everything already written is already counted", len(reading.Entries))
 	}
-	if want := formatCursor(int64(len(line) * 2)); reading.Cursor != want {
-		t.Errorf("cursor = %q, want %q", reading.Cursor, want)
+	if offset, _, ok := parseCursor(reading.Cursor); !ok || offset != int64(len(line)*2) {
+		t.Errorf("cursor %q resolves to offset %d, want %d", reading.Cursor, offset, len(line)*2)
 	}
 
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
@@ -455,5 +462,601 @@ func TestUsageReaderIsUsableAsAStructLiteral(t *testing.T) {
 	}
 	if len(reading.Entries) != 1 || reading.Entries[0].Usage.InputTokens != 3 {
 		t.Errorf("reading = %+v, want one entry of 3 input tokens", reading)
+	}
+}
+
+// A transcript that shrank was replaced, and the reading that follows starts at
+// its beginning. That has to be announced: the consumer accumulates, so a
+// silent restart adds the file's history to a total that already holds it.
+func TestTruncatedTranscriptAnnouncesTheRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+
+	line := func(model string, out int64) string {
+		return `{"type":"assistant","message":{"model":"` + model +
+			`","usage":{"input_tokens":1,"output_tokens":` +
+			strconv.FormatInt(out, 10) + `}}}` + "\n"
+	}
+
+	if err := os.WriteFile(path, []byte(line("claude-opus-5", 10)+line("claude-opus-5", 20)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewTranscriptReader()
+	first, err := r.ReadNew(path, "")
+	if err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	if first.Reset {
+		t.Error("a first read is not a restart")
+	}
+	if len(first.Entries) != 2 {
+		t.Fatalf("first read returned %d entries, want 2", len(first.Entries))
+	}
+
+	// The file is rotated: same name, shorter contents.
+	if err := os.WriteFile(path, []byte(line("claude-opus-5", 5)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := r.ReadNew(path, first.Cursor)
+	if err != nil {
+		t.Fatalf("read after truncation: %v", err)
+	}
+	if !second.Reset {
+		t.Error("a transcript shorter than the cursor must report Reset, or its history is counted twice")
+	}
+	if len(second.Entries) != 1 {
+		t.Errorf("read after truncation returned %d entries, want 1", len(second.Entries))
+	}
+}
+
+// A resolved path is remembered so the search happens once. When the file
+// behind it disappears the answer has to be dropped, or the session's cost is
+// frozen for the rest of the process.
+func TestVanishedTranscriptIsSearchedForAgain(t *testing.T) {
+	root := t.TempDir()
+	first := filepath.Join(root, "project-a")
+	second := filepath.Join(root, "project-b")
+	for _, d := range []string{first, second} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entry := `{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2}}}` + "\n"
+	original := filepath.Join(first, "s1.jsonl")
+	if err := os.WriteFile(original, []byte(entry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	r := &UsageReader{ProjectsDir: root, RetryLookupAfter: time.Minute}
+	r.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	if _, err := r.ReadUsage(ctx, "s1", ""); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+
+	// The session's directory is renamed, which moves the transcript because the
+	// tool encodes the working directory into its location.
+	if err := os.Remove(original); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReadUsage(ctx, "s1", ""); musem.ErrorCode(err) != musem.ENOTFOUND {
+		t.Fatalf("read of a deleted transcript = %v, want ENOTFOUND", err)
+	}
+
+	moved := filepath.Join(second, "s1.jsonl")
+	if err := os.WriteFile(moved, []byte(entry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inside the backoff the miss is still remembered, which is the whole point
+	// of remembering it: a session with no transcript must not re-scan every
+	// project directory on every refresh.
+	if _, err := r.ReadUsage(ctx, "s1", ""); musem.ErrorCode(err) != musem.ENOTFOUND {
+		t.Errorf("read inside the retry backoff = %v, want ENOTFOUND", err)
+	}
+
+	now = now.Add(2 * time.Minute)
+	reading, err := r.ReadUsage(ctx, "s1", "")
+	if err != nil {
+		t.Fatalf("read after the transcript moved: %v", err)
+	}
+	if len(reading.Entries) != 1 {
+		t.Errorf("got %d entries after the move, want 1: the stale path was never dropped", len(reading.Entries))
+	}
+}
+
+// A cursor that cannot be read leaves the file to be read from the start, and
+// the caller holding totals built from the cursor that was lost. Adding a full
+// re-read to those roughly doubles them, so this path has to announce the
+// restart exactly as the truncation path does.
+func TestUnreadableCursorAnnouncesTheRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+	entry := `{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2}}}` + "\n"
+	if err := os.WriteFile(path, []byte(entry+entry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewTranscriptReader()
+
+	for _, cursor := range []string{"not-a-number", "-17", "12,7"} {
+		reading, err := r.ReadNew(path, cursor)
+		if err != nil {
+			t.Fatalf("cursor %q: %v", cursor, err)
+		}
+		if !reading.Reset {
+			t.Errorf("cursor %q: re-read the file from the start without reporting Reset, so its usage is counted twice",
+				cursor)
+		}
+		if len(reading.Entries) != 2 {
+			t.Errorf("cursor %q: got %d entries, want the whole file", cursor, len(reading.Entries))
+		}
+	}
+
+	// The two cursors that legitimately mean something must not claim a restart.
+	for _, cursor := range []string{"", CursorEnd} {
+		reading, err := r.ReadNew(path, cursor)
+		if err != nil {
+			t.Fatalf("cursor %q: %v", cursor, err)
+		}
+		if reading.Reset {
+			t.Errorf("cursor %q: reported a restart, but nothing had been counted from a lost cursor", cursor)
+		}
+	}
+}
+
+// The payload belongs to another tool and can change shape without warning. One
+// record musem cannot read must cost the user that session, not every session —
+// the same degradation the transcript reader applies line by line.
+func TestOneUnreadableAgentRecordDoesNotDiscardTheRest(t *testing.T) {
+	// The middle record's startedAt has become a string, as a CLI change might
+	// leave it.
+	payload := []byte(`[
+		{"sessionId":"a","name":"api","cwd":"/p/api","status":"running","pid":1,"startedAt":1700000000000},
+		{"sessionId":"b","name":"web","cwd":"/p/web","status":"idle","pid":2,"startedAt":"2026-01-01T00:00:00Z"},
+		{"sessionId":"c","name":"docs","cwd":"/p/docs","status":"idle","pid":3,"startedAt":1700000000000}
+	]`)
+
+	sessions, err := parseAgents(payload)
+	if err != nil {
+		t.Fatalf("one unreadable record failed the whole list: %v", err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("got %d sessions, want the 2 that could be read: %+v", len(sessions), sessions)
+	}
+	for _, want := range []string{"a", "c"} {
+		var found bool
+		for _, s := range sessions {
+			if s.ID == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("session %q was discarded along with the record that could not be read", want)
+		}
+	}
+}
+
+// A payload that is not a list at all is a different matter: there is nothing
+// to degrade to, and saying so is better than reporting no sessions.
+func TestAWhollyUnrecognisedPayloadIsStillAnError(t *testing.T) {
+	if _, err := parseAgents([]byte(`{"sessions": []}`)); musem.ErrorCode(err) != musem.EUNPARSEABLE {
+		t.Errorf("err = %v, want EUNPARSEABLE", err)
+	}
+}
+
+// A transcript deleted and written again is a different file wearing the same
+// name. Size alone cannot tell it from one that merely grew: replaced at or
+// beyond the old offset, the read resumes mid-record and everything before that
+// point is never counted.
+func TestReplacedTranscriptIsDetectedEvenWhenItGrew(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+
+	entry := func(model string, out int64) string {
+		return `{"type":"assistant","message":{"model":"` + model +
+			`","usage":{"input_tokens":1,"output_tokens":` + strconv.FormatInt(out, 10) +
+			`},"padding":"` + strings.Repeat("x", 400) + `"}}` + "\n"
+	}
+
+	original := entry("claude-opus-5", 1) + entry("claude-opus-5", 2)
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewTranscriptReader()
+	first, err := r.ReadNew(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Entries) != 2 {
+		t.Fatalf("first read: %d entries, want 2", len(first.Entries))
+	}
+
+	// Replaced by a different, longer transcript for the same session.
+	replacement := entry("claude-sonnet-5", 7) + entry("claude-sonnet-5", 8) + entry("claude-sonnet-5", 9)
+	if len(replacement) <= len(original) {
+		t.Fatal("the replacement must be longer, or this is the truncation case")
+	}
+	if err := os.WriteFile(path, []byte(replacement), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := r.ReadNew(path, first.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Reset {
+		t.Error("a replaced transcript must report Reset; resuming mid-file loses everything before the offset")
+	}
+	if len(second.Entries) != 3 {
+		t.Errorf("got %d entries, want all 3 of the replacement", len(second.Entries))
+	}
+}
+
+// Appending must never look like a replacement — the head of an append-only
+// file does not change, and a fingerprint that moved with it would re-read the
+// whole transcript on every pass.
+func TestAppendingIsNotMistakenForReplacement(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+
+	entry := `{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2}}}` + "\n"
+	if err := os.WriteFile(path, []byte(entry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewTranscriptReader()
+	cursor := ""
+	total := 0
+	restarts := 0
+
+	// Grow the file well past the fingerprint window, one record at a time.
+	// Totals are accumulated exactly as the accountant accumulates them, so a
+	// restart that double-counts shows up here as it would in the real figure.
+	for i := 0; i < 20; i++ {
+		reading, err := r.ReadNew(path, cursor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reading.Reset {
+			restarts++
+			total = 0
+		}
+		total += len(reading.Entries)
+		cursor = reading.Cursor
+
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteString(entry); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The file starts too short to identify, so exactly one restart is expected:
+	// the pass on which its head first becomes hashable. More than that means
+	// the fingerprint is moving with the file and every append looks like a
+	// replacement.
+	if restarts > 1 {
+		t.Errorf("%d restarts across 20 appends, want at most the one where the head became hashable", restarts)
+	}
+	if total != 20 {
+		t.Errorf("counted %d entries across 20 appends, want 20: records were counted more than once", total)
+	}
+}
+
+// Two transcripts can carry one session identifier, and choosing between them
+// by modification time oscillates: anything that touches the loser makes it the
+// winner again, and every switch reads an unseen file from zero, reports a
+// restart, and wipes the session's accumulated total.
+//
+// A resolved path is therefore kept while its file exists. The cost is a
+// deliberate one: a session whose directory is renamed keeps being read from
+// the transcript it was already reading, so its figure stops moving. A figure
+// that stops is recoverable; one that is destroyed on every flip is not.
+func TestResolvedPathSurvivesAnMtimeFlip(t *testing.T) {
+	root := t.TempDir()
+	oldDir := filepath.Join(root, "project-old")
+	newDir := filepath.Join(root, "project-new")
+	for _, d := range []string{oldDir, newDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entry := `{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2}}}` + "\n"
+	oldPath := filepath.Join(oldDir, "s1.jsonl")
+	if err := os.WriteFile(oldPath, []byte(entry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &UsageReader{ProjectsDir: root}
+	ctx := context.Background()
+	if _, err := r.ReadUsage(ctx, "s1", ""); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	if got := r.paths["s1"]; got != oldPath {
+		t.Fatalf("path = %q, want %q", got, oldPath)
+	}
+
+	// A second transcript appears for the same session, newer than the first.
+	newPath := filepath.Join(newDir, "s1.jsonl")
+	if err := os.WriteFile(newPath, []byte(entry+entry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(time.Hour)
+	if err := os.Chtimes(newPath, later, later); err != nil {
+		t.Fatal(err)
+	}
+
+	// Whichever file is touched, and however often, the answer does not move.
+	for i := 0; i < 5; i++ {
+		touch := oldPath
+		if i%2 == 0 {
+			touch = newPath
+		}
+		when := time.Now().Add(time.Duration(i+2) * time.Hour)
+		if err := os.Chtimes(touch, when, when); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.ReadUsage(ctx, "s1", ""); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.paths["s1"]; got != oldPath {
+			t.Fatalf("pass %d: path flipped to %q; each flip wipes the session's total", i, got)
+		}
+	}
+
+	// It moves only when the file it was reading is gone.
+	if err := os.Remove(oldPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReadUsage(ctx, "s1", ""); err != nil {
+		t.Fatalf("read after the resolved transcript was deleted: %v", err)
+	}
+	if got := r.paths["s1"]; got != newPath {
+		t.Errorf("path = %q once the old transcript was deleted, want %q", got, newPath)
+	}
+}
+
+// The CLI's own explanation is the actionable part of a discovery failure.
+func TestDiscoveryFailureCarriesTheCLIExplanation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stub relies on a POSIX shell")
+	}
+	bin := filepath.Join(t.TempDir(), "claude")
+	script := "#!/bin/sh\necho 'error: unknown option --json' >&2\nexit 2\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Discoverer{Bin: bin, Timeout: 5 * time.Second}
+	_, err := d.Discover(context.Background())
+	if err == nil {
+		t.Fatal("a non-zero exit must be an error")
+	}
+	if !strings.Contains(musem.ErrorMessage(err), "unknown option") {
+		t.Errorf("message = %q; the CLI's own explanation was discarded", musem.ErrorMessage(err))
+	}
+}
+
+// A transcript too short to fingerprint mints a cursor that cannot prove which
+// file it came from. Resuming into a replacement on the strength of it skips
+// everything before the offset and adds the rest to another file's totals.
+func TestShortTranscriptReplacedByALongerOneIsDetected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+	entry := `{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2}}}` + "\n"
+
+	// Deliberately unpadded: the file is under the fingerprint window, which is
+	// exactly the case a padded fixture would hide.
+	if err := os.WriteFile(path, []byte(entry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if len(entry) >= fingerprintBytes {
+		t.Fatal("the fixture must be shorter than the fingerprint window")
+	}
+
+	r := NewTranscriptReader()
+	first, err := r.ReadNew(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replacement := strings.Repeat(entry, 12)
+	if err := os.WriteFile(path, []byte(replacement), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := r.ReadNew(path, first.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Reset {
+		t.Error("a replacement of an unidentifiable file must report a restart, not resume into it")
+	}
+	if len(second.Entries) != 12 {
+		t.Errorf("got %d entries, want all 12 of the replacement", len(second.Entries))
+	}
+}
+
+// The cursor that carries accounting forward from elsewhere must not be
+// re-read: its totals are already believed complete.
+func TestCursorEndIsNeverTreatedAsUnverifiable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+	entry := `{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2}}}` + "\n"
+	if err := os.WriteFile(path, []byte(strings.Repeat(entry, 20)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reading, err := NewTranscriptReader().ReadNew(path, CursorEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reading.Reset {
+		t.Error("CursorEnd reported a restart; the carried-forward total would be wiped and the file recounted")
+	}
+	if len(reading.Entries) != 0 {
+		t.Errorf("got %d entries, want 0", len(reading.Entries))
+	}
+}
+
+// A file long enough to identify when the cursor was written, and too short to
+// identify now, cannot be the same file. The size check alone misses this
+// whenever the replacement lands between the old offset and the fingerprint
+// window — the read then resumes into a stranger and adds it to another file's
+// totals.
+func TestTranscriptReplacedByAShorterOneIsDetected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+	entry := `{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2}}}` + "\n"
+
+	// One complete record followed by a long unterminated fragment: the file is
+	// past the fingerprint window, so the cursor carries one.
+	if err := os.WriteFile(path, []byte(entry+strings.Repeat("x", 600)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewTranscriptReader()
+	first, err := r.ReadNew(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, fp, _ := parseCursor(first.Cursor); fp == "" {
+		t.Fatal("the fixture must produce a cursor carrying a fingerprint")
+	}
+
+	// Replaced by a different transcript that is shorter than the window but
+	// longer than the offset the cursor holds.
+	replacement := entry + entry
+	if len(replacement) >= fingerprintBytes {
+		t.Fatal("the replacement must be shorter than the fingerprint window")
+	}
+	if err := os.WriteFile(path, []byte(replacement), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := r.ReadNew(path, first.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Reset {
+		t.Error("a file that stopped being identifiable was resumed into rather than restarted")
+	}
+	if len(second.Entries) != 2 {
+		t.Errorf("got %d entries, want both records of the replacement", len(second.Entries))
+	}
+}
+
+// The CLI's message reaches the dashboard header, where half a character is
+// both unreadable and mis-measured by everything that lays the line out.
+func TestCLIDetailIsTruncatedOnARuneBoundary(t *testing.T) {
+	got := firstLine(strings.Repeat("→", 400))
+
+	if !utf8.ValidString(got) {
+		t.Errorf("firstLine produced invalid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("a truncated message must say so: %q", got)
+	}
+}
+
+// The cache-creation split is trusted only as far as it accounts for the total
+// the same record reports. A time-to-live tier this reader has never heard of
+// would otherwise vanish from both the token count and the bill — silently,
+// with nothing marked, which is the one outcome the design rules out.
+func TestUnaccountedCacheTierIsNotDroppedSilently(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+
+	// The split names 100 + 200, but the record's own total is 500: 200 tokens
+	// belong to a tier this reader does not know about.
+	line := `{"type":"assistant","message":{"model":"claude-opus-5","usage":{` +
+		`"input_tokens":0,"output_tokens":0,` +
+		`"cache_creation_input_tokens":500,` +
+		`"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":200}}}}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reading, err := NewTranscriptReader().ReadNew(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reading.Entries) != 1 {
+		t.Fatalf("got %d entries, want 1", len(reading.Entries))
+	}
+
+	got := reading.Entries[0].Usage
+	if total := got.CacheWriteTokens(); total != 500 {
+		t.Errorf("counted %d cache-creation tokens, want the 500 the record reports: "+
+			"%d went missing with no marker", total, 500-total)
+	}
+	// The shortfall lands on the cheaper tier, so the money understates rather
+	// than inflating — the same trade the older-record path makes.
+	if got.CacheWrite1hTokens != 200 {
+		t.Errorf("1h tier = %d, want the 200 the split names", got.CacheWrite1hTokens)
+	}
+}
+
+// A cursor descended from CursorEnd carries a total that was never derived from
+// reading this file, so re-reading cannot reproduce it. The restart rules must
+// defer to that lineage even after the file becomes identifiable, or the
+// carried-forward history CursorEnd exists to protect is destroyed.
+func TestCursorEndLineageSurvivesTheFileBecomingIdentifiable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+	entry := `{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2}}}` + "\n"
+
+	// Short enough to have no fingerprint, which is the window the loss needs.
+	if err := os.WriteFile(path, []byte(entry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if len(entry) >= fingerprintBytes {
+		t.Fatal("the fixture must be shorter than the fingerprint window")
+	}
+
+	r := NewTranscriptReader()
+	adopted, err := r.ReadNew(path, CursorEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adopted.Reset || len(adopted.Entries) != 0 {
+		t.Fatalf("adopting the file counted %d entries (reset=%v), want none",
+			len(adopted.Entries), adopted.Reset)
+	}
+
+	// The transcript grows past the point where it can be identified.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(strings.Repeat(entry, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	next, err := r.ReadNew(path, adopted.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Reset {
+		t.Error("the adopted cursor was treated as re-readable; the carried-forward total is wiped and the file recounted")
+	}
+	if len(next.Entries) != 10 {
+		t.Errorf("got %d entries, want the 10 appended after adoption", len(next.Entries))
 	}
 }

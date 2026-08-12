@@ -5,9 +5,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"hash/fnv"
 	"io"
 	"os"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/MrSossa/musem"
 )
@@ -15,8 +18,9 @@ import (
 // transcriptLine is the subset of a JSONL entry musem cares about. A transcript
 // carries many record types; only assistant responses report usage.
 type transcriptLine struct {
-	Type    string `json:"type"`
-	Message struct {
+	Type      string `json:"type"`
+	Timestamp string `json:"timestamp"`
+	Message   struct {
 		Model string `json:"model"`
 		Usage *struct {
 			InputTokens         int64 `json:"input_tokens"`
@@ -72,24 +76,85 @@ func (r *TranscriptReader) ReadNew(path, cursor string) (musem.UsageReading, err
 		return musem.UsageReading{}, musem.Wrap(err, musem.EUNAVAILABLE, "cannot stat transcript %s", path)
 	}
 
-	offset := parseCursor(cursor)
+	// Every path that starts the file over reports it, because the caller
+	// accumulates: re-reading from the beginning without saying so adds the
+	// file's history to a total that already holds it. The flag is what turns
+	// "count these as well" into "count these instead".
+	offset, remembered, usable := parseCursor(cursor)
+	reset := !usable
 	if cursor == CursorEnd {
-		offset = info.Size()
+		offset, reset = info.Size(), false
 	}
+
+	// A transcript that was deleted and written again is a different file that
+	// happens to share a name. Size alone cannot tell it apart from one that
+	// merely grew: replaced at or beyond the old offset, the read would resume
+	// from the middle of a record it has never seen and silently skip
+	// everything before it. The head of the file settles the question.
+	current, err := fingerprint(f)
+	if err != nil {
+		return musem.UsageReading{}, musem.Wrap(err, musem.EUNAVAILABLE, "cannot read transcript %s", path)
+	}
+	// A cursor descended from CursorEnd carries a total that was never derived
+	// from reading this file, so re-reading cannot reproduce it. Its lineage is
+	// recorded in the cursor itself and every restart rule below defers to it:
+	// discarding those totals would destroy exactly what CursorEnd was added to
+	// protect.
+	adopted := cursor == CursorEnd || remembered == CursorEnd
+
+	switch {
+	case adopted:
+		// Deliberately unverifiable: this cursor exists to adopt a file whose
+		// totals are already believed complete, so there is nothing to compare
+		// against and nothing to re-read.
+
+	case remembered != "" && current != "" && remembered != current:
+		offset, reset = 0, true
+
+	case remembered != "" && current == "":
+		// The file was long enough to identify when the cursor was written and
+		// is too short to identify now, so it cannot be the same file — it was
+		// replaced by a smaller one. The size check below only catches that when
+		// the replacement is shorter than the offset too; between the offset and
+		// the fingerprint window it would otherwise resume into a stranger.
+		offset, reset = 0, true
+
+	case remembered == "" && current != "" && offset > 0:
+		// The cursor was taken while the file was still too short to identify,
+		// and the file can be identified now. Whether it is the same file is
+		// unknowable, and resuming into a file this reader has never seen would
+		// skip everything before the offset and add the rest to totals derived
+		// from a different file.
+		//
+		// Starting over costs one re-read, once per file, and yields the right
+		// total either way. It also retires cursors written before fingerprints
+		// existed, which have the same unverifiability for the same reason.
+		offset, reset = 0, true
+	}
+
 	// A file shorter than where we left off was replaced or truncated, so the
 	// remembered offset is meaningless and the only safe move is to start over.
 	if info.Size() < offset {
-		offset = 0
+		offset, reset = 0, true
 	}
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return musem.UsageReading{}, musem.Wrap(err, musem.EUNAVAILABLE, "cannot seek transcript %s", path)
 	}
 
+	// The lineage outlives the file being too short to identify: without it the
+	// next pass, once the head becomes hashable, would see a bare cursor and
+	// start over.
+	mark := current
+	if mark == "" && adopted {
+		mark = CursorEnd
+	}
+
 	usage, skipped, consumed, err := scanUsage(f)
 	reading := musem.UsageReading{
 		Entries: usage,
-		Cursor:  formatCursor(offset + consumed),
+		Cursor:  formatCursor(mark, offset+consumed),
 		Skipped: skipped,
+		Reset:   reset,
 	}
 	if err != nil {
 		return reading, err
@@ -103,21 +168,78 @@ func (r *TranscriptReader) ReadNew(path, cursor string) (musem.UsageReading, err
 // believed complete and re-reading the file would add it to itself.
 const CursorEnd = "end"
 
-// parseCursor turns a cursor back into a byte offset. Anything unrecognised
-// reads as "start from the beginning", which recounts rather than skips: an
-// inflated total is visible and correctable, silently missing usage is not.
-func parseCursor(cursor string) int64 {
-	if cursor == "" {
-		return 0
+// fingerprintBytes is how much of a transcript's head is hashed to identify it.
+// Enough to cover the first record, which carries the session's own start, and
+// cheap enough to re-read on every pass.
+const fingerprintBytes = 512
+
+// fingerprint identifies a file by its head, so a replacement can be told from
+// a continuation.
+//
+// A file shorter than the full head has no fingerprint, and that is deliberate
+// rather than a gap. Hashing whatever happens to be there would produce a value
+// that changes as the file grows — every append would look like a replacement
+// and re-read the file from the start. Only a complete head is stable, because
+// a transcript is append-only and its first bytes never change again.
+//
+// An empty result is therefore "not identifiable yet", not an error: a
+// transcript that short has almost nothing counted against it either.
+func fingerprint(f *os.File) (string, error) {
+	buf := make([]byte, fingerprintBytes)
+	n, err := f.ReadAt(buf, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
 	}
-	offset, err := strconv.ParseInt(cursor, 10, 64)
-	if err != nil || offset < 0 {
-		return 0
+	if n < fingerprintBytes {
+		return "", nil
 	}
-	return offset
+
+	h := fnv.New64a()
+	_, _ = h.Write(buf[:n])
+	return strconv.FormatUint(h.Sum64(), 16), nil
 }
 
-func formatCursor(offset int64) string { return strconv.FormatInt(offset, 10) }
+// parseCursor turns a cursor back into a byte offset and the fingerprint of the
+// file it was taken from, reporting whether it could be used at all.
+//
+// An empty cursor is usable: it means "from the start", and nothing has been
+// counted yet. Anything else that cannot be read is not — the file still has to
+// be read from the beginning, but the caller has totals from the cursor that
+// was lost, and adding a full re-read to those would roughly double them.
+//
+// A bare number carries no fingerprint: either the file was too short to
+// identify when it was written, or it predates fingerprints entirely. Either
+// way the caller treats it as unverifiable — see ReadNew.
+func parseCursor(cursor string) (offset int64, fingerprint string, usable bool) {
+	if cursor == "" {
+		return 0, "", true
+	}
+
+	if mark, rest, found := strings.Cut(cursor, cursorSeparator); found {
+		offset, err := strconv.ParseInt(rest, 10, 64)
+		if err != nil || offset < 0 || mark == "" {
+			return 0, "", false
+		}
+		return offset, mark, true
+	}
+
+	offset, err := strconv.ParseInt(cursor, 10, 64)
+	if err != nil || offset < 0 {
+		return 0, "", false
+	}
+	return offset, "", true
+}
+
+// cursorSeparator divides a cursor's file fingerprint from its byte offset.
+const cursorSeparator = ":"
+
+func formatCursor(fingerprint string, offset int64) string {
+	at := strconv.FormatInt(offset, 10)
+	if fingerprint == "" {
+		return at
+	}
+	return fingerprint + cursorSeparator + at
+}
 
 // maxTranscriptLine bounds how much of a single record is held in memory.
 // Transcript lines carry whole messages and are routinely far larger than a
@@ -186,6 +308,16 @@ func scanUsage(rd io.Reader) (usage []musem.ModelUsage, skipped int, consumed in
 		case u.CacheCreation != nil:
 			mu.CacheWrite5mTokens = u.CacheCreation.Ephemeral5m
 			mu.CacheWrite1hTokens = u.CacheCreation.Ephemeral1h
+
+			// The split is trusted only as far as it accounts for the total the
+			// same record reports. A tier this reader has never heard of would
+			// otherwise vanish from both the token count and the bill, silently
+			// and with nothing marked. Attributing the shortfall to the cheaper
+			// tier keeps the tokens and understates the money, which is the same
+			// trade the older-record case below makes.
+			if short := u.CacheCreationTokens - (mu.CacheWrite5mTokens + mu.CacheWrite1hTokens); short > 0 {
+				mu.CacheWrite5mTokens += short
+			}
 		default:
 			// Older records carry only the total. Attribute it to the 5-minute
 			// tier, which is the default time-to-live — the cheaper of the two,
@@ -193,7 +325,17 @@ func scanUsage(rd io.Reader) (usage []musem.ModelUsage, skipped int, consumed in
 			mu.CacheWrite5mTokens = u.CacheCreationTokens
 		}
 
-		usage = append(usage, musem.ModelUsage{Model: entry.Message.Model, Usage: mu})
+		// A timestamp musem cannot read is left zero rather than guessed: the
+		// consumer falls back to the current time, which is what it would have
+		// used anyway, instead of a date invented here.
+		var at time.Time
+		if entry.Timestamp != "" {
+			if parsed, err := time.Parse(time.RFC3339, entry.Timestamp); err == nil {
+				at = parsed
+			}
+		}
+
+		usage = append(usage, musem.ModelUsage{Model: entry.Message.Model, Usage: mu, At: at})
 	}
 }
 

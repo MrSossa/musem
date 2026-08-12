@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/MrSossa/musem"
@@ -66,6 +67,15 @@ func (d *Discoverer) Discover(ctx context.Context) ([]musem.Session, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
+	// Killing the process is not the same as getting the call back. Run waits
+	// for the goroutine copying into these buffers, and that goroutine finishes
+	// only when every process holding the pipe's write end has exited — the
+	// context kills the direct child, not a grandchild it left behind. Without a
+	// delay a credential helper, a hook, or anything wedged on a stalled mount
+	// holds this call open past the timeout and freezes the refresh loop the
+	// timeout exists to protect.
+	cmd.WaitDelay = time.Second
+
 	if err := cmd.Run(); err != nil {
 		var notFound *exec.Error
 		if errors.As(err, &notFound) {
@@ -76,6 +86,14 @@ func (d *Discoverer) Discover(ctx context.Context) ([]musem.Session, error) {
 			return nil, musem.Wrap(ctx.Err(), musem.EUNAVAILABLE,
 				"discovery timed out after %s", timeout)
 		}
+		// The CLI's own explanation is worth more than a generic failure: an
+		// unsupported flag after an upgrade, a config problem, a pending auth
+		// prompt. It was already captured; throwing it away leaves the user an
+		// error they cannot act on.
+		if detail := firstLine(stderr.String()); detail != "" {
+			return nil, musem.Wrap(err, musem.EUNAVAILABLE,
+				"the Claude CLI failed to list sessions: %s", detail)
+		}
 		return nil, musem.Wrap(err, musem.EUNAVAILABLE,
 			"the Claude CLI failed to list sessions")
 	}
@@ -83,19 +101,48 @@ func (d *Discoverer) Discover(ctx context.Context) ([]musem.Session, error) {
 	return parseAgents(stdout.Bytes())
 }
 
+// firstLine returns the first non-empty line of s, bounded so a CLI that writes
+// a stack trace to stderr cannot push the rest of the interface off the screen.
+func firstLine(s string) string {
+	const maxDetail = 200
+
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Cut on a rune boundary, not a byte one. This text reaches the
+		// dashboard header, where half a character is both unreadable and
+		// mis-measured by everything that lays the line out.
+		if runes := []rune(line); len(runes) > maxDetail {
+			line = string(runes[:maxDetail]) + "…"
+		}
+		return line
+	}
+	return ""
+}
+
 // parseAgents maps the CLI payload onto musem sessions. It is separate from the
 // process call so the mapping can be tested against fixtures without running
 // anything.
 func parseAgents(data []byte) ([]musem.Session, error) {
-	var records []agentRecord
-	if err := json.Unmarshal(data, &records); err != nil {
+	// Decoded one record at a time. The payload belongs to another tool and can
+	// change shape without warning; a single record musem cannot read must cost
+	// the user that session, not every session — the same degradation the
+	// transcript reader applies line by line.
+	var raw []json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, musem.Wrap(err, musem.EUNPARSEABLE,
 			"the session list was not in a recognised format")
 	}
 
 	now := time.Now()
-	sessions := make([]musem.Session, 0, len(records))
-	for _, r := range records {
+	sessions := make([]musem.Session, 0, len(raw))
+	for _, item := range raw {
+		var r agentRecord
+		if err := json.Unmarshal(item, &r); err != nil {
+			continue
+		}
 		if r.SessionID == "" {
 			// Without a stable identifier there is nothing to key on, and
 			// inventing one would silently create a duplicate on every refresh.
