@@ -62,6 +62,15 @@ func NewTranscriptReader() *TranscriptReader { return &TranscriptReader{} }
 // cost the caller every other figure in the file. The count of skipped lines is
 // reported so the caller can surface that something was lost.
 func (r *TranscriptReader) ReadNew(path, cursor string) (musem.UsageReading, error) {
+	// Opening a variable path is the point of this function, so gosec's warning
+	// cannot be designed away — it can only be answered. The path is not supplied
+	// by a caller who chose it: it is a match returned by the glob in
+	// UsageReader.resolve, rooted at the projects directory, and the identifier
+	// that glob is built from has already been refused if it carries a separator
+	// or a pattern character. See checkSessionID, which exists for this reason.
+	// The file is opened read-only and parsed line by line; nothing here is
+	// executed and nothing is written back.
+	// #nosec G304 -- path is a glob match under the projects root, not caller-chosen
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {

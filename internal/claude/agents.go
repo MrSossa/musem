@@ -63,6 +63,14 @@ func (d *Discoverer) Discover(ctx context.Context) ([]musem.Session, error) {
 	defer cancel()
 
 	var stdout, stderr bytes.Buffer
+	// The binary is a variable, which is what gosec objects to, but nothing an
+	// attacker reaches: it is a field on this struct, defaulted to "claude" and
+	// set only by the code that wires the adapter up. The arguments beside it are
+	// constants, and there is no shell — exec.CommandContext passes an argv, so a
+	// binary name carrying spaces or metacharacters is a filename that will not
+	// be found, not a second command. Resolving it via PATH is the intent: musem
+	// runs the CLI the user's own shell would.
+	// #nosec G204 -- bin is a configured field, never external input; argv, no shell
 	cmd := exec.CommandContext(ctx, bin, "agents", "--json")
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

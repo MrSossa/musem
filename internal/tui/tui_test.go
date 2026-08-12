@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -305,38 +306,58 @@ func TestDashboardHasNoMutatingOperations(t *testing.T) {
 		"Write": "writing",
 	}
 
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", nil, 0)
+	// The sources are listed and parsed one by one rather than with
+	// parser.ParseDir, which is deprecated: it associates files with packages
+	// without consulting build tags, so what it hands back is a guess about
+	// which files are even part of the build. Nothing here needs the grouping
+	// into packages — every file that is not a test is scanned the same way —
+	// so reading the directory directly costs a loop and removes the guess.
+	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	for _, pkg := range pkgs {
-		for name, file := range pkg.Files {
-			if strings.HasSuffix(name, "_test.go") {
-				continue
-			}
-			for _, imp := range file.Imports {
-				path := strings.Trim(imp.Path.Value, `"`)
-				if reason, bad := forbidden[path]; bad {
-					t.Errorf("%s imports %q (%s); the dashboard is read-only", name, path, reason)
-				}
-				if strings.HasPrefix(path, "os/exec") || path == "os" {
-					t.Errorf("%s imports %q; the dashboard is read-only", name, path)
-				}
-			}
-			ast.Inspect(file, func(n ast.Node) bool {
-				sel, ok := n.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				switch sel.Sel.Name {
-				case "Remove", "RemoveAll", "WriteFile", "Create", "Kill":
-					t.Errorf("%s calls %s; the dashboard must not alter anything", name, sel.Sel.Name)
-				}
-				return true
-			})
+	fset := token.NewFileSet()
+	scanned := 0
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
 		}
+
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", name, err)
+		}
+		scanned++
+
+		for _, imp := range file.Imports {
+			path := strings.Trim(imp.Path.Value, `"`)
+			if reason, bad := forbidden[path]; bad {
+				t.Errorf("%s imports %q (%s); the dashboard is read-only", name, path, reason)
+			}
+			if strings.HasPrefix(path, "os/exec") || path == "os" {
+				t.Errorf("%s imports %q; the dashboard is read-only", name, path)
+			}
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			switch sel.Sel.Name {
+			case "Remove", "RemoveAll", "WriteFile", "Create", "Kill":
+				t.Errorf("%s calls %s; the dashboard must not alter anything", name, sel.Sel.Name)
+			}
+			return true
+		})
+	}
+
+	// A scan that matched nothing would pass without having looked at anything,
+	// which is the one result this test must not be able to report.
+	if scanned == 0 {
+		t.Fatal("no sources were scanned; this check cannot vouch for anything")
 	}
 }
 
@@ -552,7 +573,7 @@ func TestUnpricedModelsAreNamedInTheDetailPane(t *testing.T) {
 	m := withSnapshot(NewModel(), snapshot(r))
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = next.(Model)
-	view := press(next.(Model), "enter").View()
+	view := press(m, "enter").View()
 
 	if !strings.Contains(view, "claude-from-the-future") {
 		t.Error("the detail pane says the cost is incomplete but never says which rate is missing")

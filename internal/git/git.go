@@ -54,6 +54,15 @@ func (r *BranchResolver) Branch(ctx context.Context, dir string) (string, error)
 	defer cancel()
 
 	var stdout bytes.Buffer
+	// Two variables here, and gosec flags the pair. Neither is a command. The
+	// binary is a field on this struct, defaulted to "git" and set only by the
+	// code that wires the adapter up. The directory comes from a discovered
+	// session and is genuinely foreign, but it arrives as one element of an argv
+	// — there is no shell to reinterpret it — and it is passed after "-C", where
+	// git reads it as a path and nothing else. A directory that does not exist,
+	// or is not a repository, is the routine case this function already answers
+	// with an empty branch name.
+	// #nosec G204 -- bin is a configured field; dir is an argv element after -C, no shell
 	cmd := exec.CommandContext(ctx, bin, "-C", dir, "rev-parse", "--abbrev-ref", "HEAD")
 	cmd.Stdout = &stdout
 	cmd.Stderr = nil
