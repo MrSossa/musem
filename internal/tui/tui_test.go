@@ -693,6 +693,73 @@ func TestOverlayPaneLinesNeverExceedTheTerminalWidth(t *testing.T) {
 	}
 }
 
+// The layout test below proves the arithmetic holds when the measurement agrees
+// with the terminal, but it pins the measurement itself to do so — so it cannot
+// see the measurement being fixed to a constant again. This is what does.
+//
+// A constant is reproducible and, on the terminal that disagrees with it, wrong
+// in the one direction that costs a line: cells padded to a width the terminal
+// does not draw them at.
+func TestWidthsAreMeasuredTheWayTheTerminalDrawsThem(t *testing.T) {
+	if widths.EastAsianWidth != runewidth.IsEastAsian() {
+		t.Errorf("ambiguous glyphs are measured as %d cells while the environment reports a terminal that draws them as %d",
+			widths.StringWidth("—"), widestWidths.StringWidth("—"))
+	}
+}
+
+// A terminal that draws East-Asian ambiguous glyphs at two cells is one musem
+// has to fit, and this interface is made of them: the circle of a status, the
+// em dash of a missing branch or an unknown cost, the ellipsis truncation
+// appends, the cursor's own arrow. Measured as one cell there, every padded cell
+// comes out over its column and the row wraps onto a line View never counted —
+// which is what pushes the fleet total off the top of the screen.
+func TestEveryLineFitsATerminalThatWidensAmbiguousGlyphs(t *testing.T) {
+	wide := &runewidth.Condition{EastAsianWidth: true}
+	restore := widths
+	widths = wide // a terminal that draws the ambiguous glyphs at two cells
+	t.Cleanup(func() { widths = restore })
+
+	rows := []app.Row{
+		row("a", "api", musem.StatusRunning),
+		row("b", "web", musem.StatusWaiting),
+		row("c", "worker", musem.StatusIdle),
+		row("d", "batch", musem.StatusDead),
+		row("e", "mystery", musem.StatusIndeterminate),
+	}
+	// Every ambiguous glyph the table can produce, on one row or another.
+	rows[0].Session.Branch = "main"
+	rows[1].Session.Dir = "/home/dev/" + strings.Repeat("deep/", 20) + "service"
+	rows[2].Cost, rows[2].Partial = musem.UnknownCost(), true
+	rows[3].Degraded = true
+	rows[4].Session.Name = strings.Repeat("名", 30)
+
+	s := snapshot(rows...)
+	s.Fleet = cost.Fleet{Cost: musem.UnknownCost(), Priced: 12.5, Unrecorded: 1, Skipped: 3}
+	s.Stale = true
+
+	for _, width := range []int{20, 40, 69, 80, 102, 140} {
+		for _, height := range []int{8, 12, 40} {
+			m := withSnapshot(NewModel(), s)
+			next, _ := m.Update(tea.WindowSizeMsg{Width: width, Height: height})
+			m = next.(Model)
+
+			panes := map[string]string{
+				"table":  m.View(),
+				"help":   press(m, "?").View(),
+				"detail": press(m, "enter").View(),
+			}
+			for name, pane := range panes {
+				for i, line := range strings.Split(strings.TrimSuffix(pane, "\n"), "\n") {
+					if got := wide.StringWidth(stripANSI(line)); got > width {
+						t.Errorf("%s at %dx%d: line %d draws %d cells and wraps: %q",
+							name, width, height, i, got, stripANSI(line))
+					}
+				}
+			}
+		}
+	}
+}
+
 // One gap, one label. Partial is true of an unaccounted session too, so testing
 // it beside the unaccounted count renders both and says less, not more.
 func TestEachGapIsLabelledOnce(t *testing.T) {

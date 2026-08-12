@@ -197,23 +197,31 @@ func visibleColumns(width int) []column {
 	return visible
 }
 
-// widths measures text with an explicit East-Asian setting rather than deferring
-// to the locale.
+// widths measures text the way the terminal draws it, which is what the locale
+// reports.
 //
-// Left to the default, the same string measures differently depending on the
-// user's environment, which makes every width in this package a guess about
-// where the program is run. Fixing the condition makes the measurement
-// deterministic; the cell reserved in renderHeader covers the terminals that
-// draw ambiguous glyphs wider than this says.
-var widths = &runewidth.Condition{EastAsianWidth: false}
+// Whether an East-Asian ambiguous glyph takes one cell or two is a property of
+// the terminal, not of musem, and this interface is full of them: the circles of
+// a status, the em dash of a missing branch, the ellipsis truncation appends.
+// Fixing the answer to "one" would make every measurement here reproducible and,
+// on a terminal that draws them at two, wrong — each padded cell would come out
+// a cell over its column, and the row would overflow the width the layout was
+// budgeted against and wrap onto a line View never counted. That costs the fleet
+// total exactly as an unclipped header does.
+//
+// Padding is therefore exact on either kind of terminal, which is what keeps the
+// columns lined up. It is a variable so a test can stand on the other kind
+// without being run there.
+var widths = &runewidth.Condition{EastAsianWidth: runewidth.IsEastAsian()}
 
 // widestWidths measures the same text on the assumption that every ambiguous
-// glyph is drawn at two cells, which is what some terminals do.
+// glyph is drawn at two cells.
 //
-// Where being a cell short is harmless and overflowing is not, this is the
-// measurement to use: it can only ever reserve too much room. Column padding
-// uses the ordinary condition instead, because there a cell of slack is a
-// visible misalignment rather than a safety margin.
+// It is the measurement for lines where only the ceiling matters and being a
+// cell short costs nothing: it can reserve too much room but never too little,
+// so it holds even where the locale and the terminal disagree. Padded columns
+// use the ordinary condition instead, because there a reserved cell nothing
+// fills is a visible misalignment rather than a safety margin.
 var widestWidths = &runewidth.Condition{EastAsianWidth: true}
 
 // pad fits s to exactly width terminal cells, so emoji and wide characters do
