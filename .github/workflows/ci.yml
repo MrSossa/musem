@@ -11,6 +11,13 @@ on:
 env:
   CGO_ENABLED: "0"
 
+# Read-only by default, declared here rather than left to the repository
+# setting. Nothing in this workflow writes to the repository, and a token scoped
+# to what the job needs is the difference between a compromised dependency
+# reading the checkout and one pushing to it.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: test (${{ matrix.os }})
