@@ -153,7 +153,10 @@ type column struct {
 }
 
 var columns = []column{
-	{title: "STATUS", width: 14, priority: 5},
+	// Wide enough for the longest status and its symbol: "? indeterminate" is
+	// fifteen cells. A column that cannot show it in full would truncate the one
+	// status whose whole purpose is admitting that musem does not know.
+	{title: "STATUS", width: 15, priority: 5},
 	{title: "SESSION", width: 20, priority: 4},
 	{title: "BRANCH", width: 18, priority: 2},
 	{title: "DIRECTORY", width: 32, priority: 1},
@@ -182,8 +185,36 @@ func visibleColumns(width int) []column {
 		}
 		visible = append(visible[:at], visible[at+1:]...)
 	}
+
+	// One column can still be wider than the terminal, because the loop above
+	// stops before dropping the last one. A row that overflows wraps, which
+	// doubles its height, blows the budget View computed from a line count, and
+	// scrolls the fleet total away — so the survivor is clamped to what is left
+	// after the cursor gutter and its trailing space.
+	if len(visible) == 1 {
+		visible[0].width = maxInt(1, minInt(visible[0].width, width-3))
+	}
 	return visible
 }
+
+// widths measures text with an explicit East-Asian setting rather than deferring
+// to the locale.
+//
+// Left to the default, the same string measures differently depending on the
+// user's environment, which makes every width in this package a guess about
+// where the program is run. Fixing the condition makes the measurement
+// deterministic; the cell reserved in renderHeader covers the terminals that
+// draw ambiguous glyphs wider than this says.
+var widths = &runewidth.Condition{EastAsianWidth: false}
+
+// widestWidths measures the same text on the assumption that every ambiguous
+// glyph is drawn at two cells, which is what some terminals do.
+//
+// Where being a cell short is harmless and overflowing is not, this is the
+// measurement to use: it can only ever reserve too much room. Column padding
+// uses the ordinary condition instead, because there a cell of slack is a
+// visible misalignment rather than a safety margin.
+var widestWidths = &runewidth.Condition{EastAsianWidth: true}
 
 // pad fits s to exactly width terminal cells, so emoji and wide characters do
 // not break alignment.
@@ -191,14 +222,38 @@ func visibleColumns(width int) []column {
 // Truncation is followed by padding rather than trusted to land on the mark: a
 // double-width glyph at the cut can leave the result a cell short, and one
 // missing cell shifts every column after it.
-func pad(s string, width int) string {
+func pad(s string, width int) string { return padWith(widths, s, width) }
+
+// padWide fits s to width cells even on a terminal that draws every ambiguous
+// glyph at two. The result can be narrower than width elsewhere, which is the
+// intended trade: a header line that overflows costs the fleet total.
+func padWide(s string, width int) string { return padWith(widestWidths, s, width) }
+
+// clip truncates s to width cells without padding it out, measured on the
+// assumption that ambiguous glyphs are drawn wide.
+//
+// Used where a line ends in free text — a working directory, a note, a key
+// description — and only the ceiling matters. A line over the ceiling wraps,
+// which costs a terminal row that View budgeted by counting newlines, and the
+// pane then pushes the header off the top of the screen.
+func clip(s string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	if runewidth.StringWidth(s) > width {
-		s = runewidth.Truncate(s, width, "…")
+	if widestWidths.StringWidth(s) > width {
+		return widestWidths.Truncate(s, width, "…")
 	}
-	if gap := width - runewidth.StringWidth(s); gap > 0 {
+	return s
+}
+
+func padWith(c *runewidth.Condition, s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if c.StringWidth(s) > width {
+		s = c.Truncate(s, width, "…")
+	}
+	if gap := width - c.StringWidth(s); gap > 0 {
 		s += strings.Repeat(" ", gap)
 	}
 	return s
@@ -212,61 +267,148 @@ func (m Model) View() string {
 	}
 
 	header := m.renderHeader(width)
-	footer := styleDim.Render("\n  ?  help   q  quit\n")
+	footer := footerText()
 
 	var b strings.Builder
 	b.WriteString(header)
 
+	// The help, empty and detail panes are written without regard to height, so
+	// they are clipped to the same budget the table gets — including the one
+	// line held back for bubbletea, which keeps the last m.height lines of the
+	// view whatever produced them. An overlay that overflows costs the header
+	// exactly as a long table does.
+	body := maxInt(1, m.height-lineCount(header)-lineCount(footer)-1)
+
 	switch {
 	case m.showHelp:
-		b.WriteString(renderHelp())
+		b.WriteString(clipLines(renderHelp(width), body, m.height))
 	case len(m.snapshot.Rows) == 0:
-		b.WriteString(m.renderEmpty())
+		b.WriteString(clipLines(m.renderEmpty(), body, m.height))
 	case m.detail:
-		b.WriteString(m.renderDetail())
+		b.WriteString(clipLines(m.renderDetail(), body, m.height))
 	default:
-		// Whatever the header and footer did not take, less the one line the
-		// column titles occupy. A non-positive result means the terminal is too
-		// short to be reasoned about, and renderTable falls back to drawing
-		// everything rather than nothing.
-		b.WriteString(m.renderTable(width, m.height-lineCount(header)-lineCount(footer)-1))
+		// Whatever the header and footer did not take, less the line the column
+		// titles occupy and one more for the terminal itself.
+		//
+		// That last one is not slack. bubbletea splits the view on newlines and
+		// keeps the final m.height elements, so a view whose text ends in a
+		// newline — as this one does — splits into one more element than it has
+		// lines, and filling the height exactly costs the first line: the fleet
+		// total, the very thing the windowing exists to keep on screen.
+		//
+		// A height of zero means the terminal has not told us its size yet, and
+		// a limit invented before the first WindowSizeMsg would hide rows for no
+		// reason; renderTable takes that as "no limit".
+		//
+		// Once the height is known the budget is clamped to a single row.
+		// Below about seven lines the header, the column titles and the footer
+		// already fill the terminal and no arrangement fits — and one row that
+		// overflows by a line is a bounded failure, where drawing every row
+		// scrolls the whole frame away and leaves nothing readable at all.
+		budget := 0
+		if m.height > 0 {
+			budget = maxInt(1, m.height-lineCount(header)-lineCount(footer)-2)
+		}
+		b.WriteString(m.renderTable(width, budget))
 	}
 
 	b.WriteString(footer)
 	return b.String()
 }
 
+// footerText is the key hint drawn under everything else.
+//
+// The newlines sit outside Render because lipgloss turns a trailing one into a
+// padded blank line and drops the newline itself — so the fragment would occupy
+// one more terminal row than lineCount reports, and every budget built on that
+// count would be wrong by one.
+func footerText() string { return "\n" + styleDim.Render("  ?  help   q  quit") + "\n" }
+
 // lineCount reports how many terminal lines s occupies. Every fragment here
 // ends in a newline, so counting newlines counts lines.
 func lineCount(s string) int { return strings.Count(s, "\n") }
 
+// clipLines truncates s to at most max lines. A height of zero means the
+// terminal has not reported its size yet, and nothing is clipped — inventing a
+// limit before the first WindowSizeMsg would hide content for no reason.
+//
+// The last kept line is replaced with an ellipsis so a clipped pane says it was
+// clipped, rather than appearing to end where it does not.
+func clipLines(s string, max, height int) string {
+	if height <= 0 || max <= 0 || lineCount(s) <= max {
+		return s
+	}
+
+	lines := strings.SplitAfter(s, "\n")
+	kept := lines[:maxInt(0, max-1)]
+	return strings.Join(kept, "") + styleDim.Render("  …") + "\n"
+}
+
 func (m Model) renderHeader(width int) string {
 	var b strings.Builder
-	b.WriteString(styleHeader.Render("  musem"))
+
+	// Every line here is bounded to the terminal width, measured on the
+	// assumption that ambiguous glyphs are drawn wide.
+	//
+	// View charges the header by its newlines, so a line long enough to wrap
+	// occupies a row nobody budgeted for — and the table, handed a row too many,
+	// pushes the total it sits above off the top of the screen. The glyphs at
+	// stake are not exotic: the em dash of an unknown cost, the staleness
+	// warning, and the ellipsis that truncation itself appends. A fixed spare
+	// cell would not cover a line carrying several of them.
+	const title = "  musem"
+	b.WriteString(styleHeader.Render(title))
 
 	fleet := m.snapshot.Fleet
 	total := fleet.Cost.String()
-	if fleet.Partial() {
-		// A partial total must never look like a complete one.
+	if !fleet.Cost.Known() && fleet.Priced > 0 {
+		// An unknown total is not the same as no information: the dollars that
+		// did price are still a floor, and a floor beats an em dash sitting
+		// above rows that each show a figure.
+		total = "at least " + musem.USD(fleet.Priced).String()
+	}
+	if fleet.Unpriceable() {
+		// A partial total must never look like a complete one. Asked as
+		// Unpriceable rather than Partial, because Partial is true of an
+		// unaccounted session too and the line below already names those —
+		// labelling one gap twice says less, not more.
 		total += " (partial)"
 	}
-	b.WriteString(styleDim.Render(fmt.Sprintf("   %d sessions   %s total\n", len(m.snapshot.Rows), total)))
+	if fleet.Unrecorded > 0 {
+		// Named rather than folded into "(partial)": this is not a figure that
+		// came out short, it is a figure that is missing whole sessions, and how
+		// many is the part the user can act on.
+		total += fmt.Sprintf(" (%d unaccounted)", fleet.Unrecorded)
+	}
+	if fleet.Degraded() {
+		// Distinct from partial, and for the same reason the rows distinguish
+		// "*" from "!": partial usage was counted but could not be priced,
+		// degraded usage never reached the total at all. One figure is
+		// incomplete, the other is simply too low.
+		total += " (understated)"
+	}
+	summary := fmt.Sprintf("   %d sessions   %s total", len(m.snapshot.Rows), total)
+	b.WriteString(styleDim.Render(padWide(summary, maxInt(0, width-widths.StringWidth(title)))))
+	b.WriteString("\n")
 
 	if m.snapshot.Stale {
-		b.WriteString(styleStale.Render("  ⚠ data is stale — the last refresh did not complete\n"))
+		b.WriteString(styleStale.Render(padWide("  ⚠ data is stale — the last refresh did not complete", width)))
+		b.WriteString("\n")
 	}
 	if msg := errorMessage(m.snapshot.ErrCode, m.snapshot.ErrMessage); msg != "" {
-		b.WriteString(styleErr.Render("  ✕ " + pad(msg, maxInt(0, width-4)) + "\n"))
+		b.WriteString(styleErr.Render("  ✕ " + padWide(msg, maxInt(0, width-4))))
+		b.WriteString("\n")
 	}
 	b.WriteString("\n")
 	return b.String()
 }
 
 func (m Model) renderEmpty() string {
+	width := m.viewWidth()
 	return styleDim.Render(
-		"  No agent sessions are running.\n\n" +
-			"  musem observes sessions started elsewhere; it does not start them.\n" +
-			"  Open one and it will appear here on the next refresh.\n")
+		clip("  No agent sessions are running.", width)+"\n\n"+
+			clip("  musem observes sessions started elsewhere; it does not start them.", width)+"\n"+
+			clip("  Open one and it will appear here on the next refresh.", width)) + "\n"
 }
 
 // renderTable draws at most maxRows lines of sessions, scrolled so the cursor
@@ -281,11 +423,19 @@ func (m Model) renderTable(width, maxRows int) string {
 	visible := visibleColumns(width)
 	rows := m.snapshot.Rows
 
+	// The indicator costs a line, and at a budget of one there is no line to
+	// spend: showing it would push the table past what View allowed and cost
+	// the header instead. A single row with no indicator is the honest fit.
+	indicator := maxRows >= 2
+
 	start, end := 0, len(rows)
 	if maxRows > 0 && len(rows) > maxRows {
 		// One line goes to the position indicator, so it is never a surprise
 		// that the list continues past the edge of the screen.
-		window := maxInt(1, maxRows-1)
+		window := maxRows
+		if indicator {
+			window = maxRows - 1
+		}
 		start = minInt(maxInt(0, m.cursor-window/2), len(rows)-window)
 		end = start + window
 	}
@@ -316,8 +466,13 @@ func (m Model) renderTable(width, maxRows int) string {
 		b.WriteString("\n")
 	}
 
-	if end-start < len(rows) {
-		b.WriteString(styleDim.Render(fmt.Sprintf("  ↕ %d–%d of %d\n", start+1, end, len(rows))))
+	if indicator && end-start < len(rows) {
+		// Clipped like every other line in the table. This one is a fixed
+		// legend rather than a padded column, so nothing else bounds it — and a
+		// wrapped indicator costs the same header row a wrapped session row
+		// would, which is the whole reason the columns are clamped above.
+		b.WriteString(styleDim.Render(
+			clip(fmt.Sprintf("  ↕ %d–%d of %d", start+1, end, len(rows)), width)) + "\n")
 	}
 	return b.String()
 }
@@ -396,19 +551,45 @@ func (m Model) renderDetail() string {
 	if row.Partial {
 		lines = append(lines, [2]string{"Note", "some usage could not be priced; tokens counted, cost incomplete"})
 	}
+	if len(row.UnknownModels) > 0 {
+		// The gap is only actionable if the user can see which rate is missing.
+		lines = append(lines, [2]string{"Unpriced", strings.Join(row.UnknownModels, ", ")})
+	}
+	if !row.Cost.Known() && row.Priced > 0 {
+		// An unknown cost is not the same as no information. The dollars that
+		// did price are carried through the domain and the store precisely so
+		// they survive an unpriceable model; showing them as a floor is what
+		// makes that effort reach the user.
+		lines = append(lines, [2]string{"At least", musem.USD(row.Priced).String()})
+	}
 	if row.Degraded {
 		lines = append(lines, [2]string{"Note", "some records could not be read; this figure understates the true cost"})
 	}
 
+	// The label column and its surrounding spaces are fixed, so whatever is left
+	// bounds the value. Values here are free text — a working directory, a note —
+	// and an unbounded one wraps onto a row View never budgeted for.
+	const labelled = 2 + 12 + 1
+
 	var b strings.Builder
 	for _, l := range lines {
-		b.WriteString("  " + styleDim.Render(pad(l[0], 12)) + " " + l[1] + "\n")
+		b.WriteString("  " + styleDim.Render(pad(l[0], 12)) + " " +
+			clip(l[1], m.viewWidth()-labelled) + "\n")
 	}
-	b.WriteString(styleDim.Render("\n  enter  back\n"))
+	b.WriteString("\n" + styleDim.Render("  enter  back") + "\n")
 	return b.String()
 }
 
-func renderHelp() string {
+// viewWidth is the terminal width to lay out against, defaulting the same way
+// View does before the first WindowSizeMsg arrives.
+func (m Model) viewWidth() int {
+	if m.width <= 0 {
+		return 80
+	}
+	return m.width
+}
+
+func renderHelp(width int) string {
 	rows := [][2]string{
 		{"j / ↓", "next session"},
 		{"k / ↑", "previous session"},
@@ -420,15 +601,17 @@ func renderHelp() string {
 	}
 	var b strings.Builder
 	for _, r := range rows {
-		b.WriteString("  " + styleHeader.Render(pad(r[0], 10)) + " " + styleDim.Render(r[1]) + "\n")
+		b.WriteString("  " + styleHeader.Render(pad(r[0], 10)) + " " +
+			styleDim.Render(clip(r[1], width-13)) + "\n")
 	}
 
 	b.WriteString("\n")
 	for _, r := range [][2]string{
-		{"$0.00*", "counted, but some of it could not be priced"},
+		{"—*", "counted, but some of it could not be priced"},
 		{"$0.00!", "some records could not be read; the figure is too low"},
 	} {
-		b.WriteString("  " + styleHeader.Render(pad(r[0], 10)) + " " + styleDim.Render(r[1]) + "\n")
+		b.WriteString("  " + styleHeader.Render(pad(r[0], 10)) + " " +
+			styleDim.Render(clip(r[1], width-13)) + "\n")
 	}
 	return b.String()
 }
