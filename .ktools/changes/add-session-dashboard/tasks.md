@@ -25,8 +25,9 @@ Scaffolding tasks that advance no single requirement are marked `infra`.
   - Verification: a test asserting unknown `Cost` never reads as zero
 - [x] 2.2 Add validation methods and pure predicates on the domain types, to be called by adapters rather than reimplemented by them — `musem.go` · R3
   - Verification: `go test .`
-- [x] 2.3 Define application error codes in `error.go` (`ENOTFOUND`, `EUNAVAILABLE`, `ESTALE`, `EUNKNOWNMODEL`), independent of any presentation concern — `error.go` · R6, R9, R15
+- [x] 2.3 Define application error codes in `error.go` (`EINTERNAL`, `EINVALID`, `ENOTFOUND`, `EUNAVAILABLE`, `EUNPARSEABLE`), independent of any presentation concern — `error.go` · R6, R9, R15
   - Verification: `go test .` plus the archtest rule that the root package imports nothing
+  - Note: this task originally listed `ESTALE` and `EUNKNOWNMODEL` too. Both were built and neither was ever produced: staleness became `registry.Snapshot`'s `Stale`/`Age` and an unpriced model became `SessionCost.UnknownModels`, because both are facts a snapshot carries about itself and an error can only be raised instead of the answer, not alongside it. Removed in task 9.3.
 
 ## 3. Agent tool adapter
 
@@ -119,7 +120,7 @@ Scaffolding tasks that advance no single requirement are marked `infra`.
 - [x] 7.12 Show an explanatory empty state when there are no sessions — `internal/tui` · R13
   - Verification: test for scenario "No sessions" of R13
 - [x] 7.13 Verify no operation exists that can alter a session or the repository · R16
-  - Verification: manual sweep of every key binding plus the archtest write/network rules
+  - Verification: manual sweep of every key binding, `TestDashboardHasNoMutatingOperations` (which scans the `tui` sources for `os`/`exec` imports and mutating calls), and the archtest network rules
 
 ## 8. Review remediation
 
@@ -142,13 +143,38 @@ Added after the phase-3 review. Each closes a finding recorded in `review.md`.
 - [x] 8.8 Replace the hand-written maxInt/minInt with the language builtins — `internal/tui/tui.go` · infra
   - Verification: `make lint`, `make test`
 
-## 9. Wrap-up
+## 9. Second review round
 
-- [x] 9.1 End-to-end verification with real parallel sessions: status, cost and freshness · R1, R13, R15
+Added after the round-2 review. Round 1's fixes held except for 8.1, which
+delivered the counter it promised but never wired it into the decision the
+finding was about.
+
+- [x] 9.1 Stop the ending sweep from running on a pass that could not read every record it found — `internal/registry/registry.go` · R20
+  - Verification: `TestUnreadableRecordsAreReportedRatherThanReadAsAnEmptyMachine` (now asserting the session's status, not only the counter), `TestAPartiallyReadPassEndsNothing`, `TestACleanPassAfterADegradedOneStillEnds`
+- [x] 9.2 Sanitise the CLI's stderr explanation before it becomes an error message — `internal/claude/agents.go` · R19
+  - Verification: `TestTheCLIExplanationCannotCarryTerminalInstructions`, `TestADisarmedSequenceIsLeftAsInertText`, `TestAnExplanationOfPureControlBytesIsSkipped`
+- [x] 9.3 Drop the two error codes nothing produces and the unreachable branch that rendered one — `error.go`, `internal/tui/tui.go` · infra
+  - Verification: `make lint`, `make test`; no `Errorf`/`Wrap` call site constructs either code
+- [x] 9.4 Correct the registry sort comment, which still described the pre-8.4 conflation of ended and dead — `internal/registry/registry.go` · infra
+  - Verification: reading it against `TestEndedSessionsSortBelowLiveOnes` and `TestAnAdapterReportedDeathIsNotSoftenedToEnded`
+- [x] 9.5 Say that a dropped record leaves rows stale as well as missing, which is the consequence 9.1 introduced — `internal/tui/tui.go` · R15, R20
+  - Verification: `TestUnreadableSessionRecordsAreAnnounced`, extended to assert both consequences are named
+- [x] 9.6 Refuse a discovery record whose identifier carries control bytes, rather than stripping it — `internal/claude/agents.go` · R19, R2
+  - Verification: `TestAnIdentifierCarryingControlBytesIsRefusedRatherThanCleaned`; the check was made to fail by neutralising it, then restored
+- [x] 9.7 Extract the sanitiser into a shared leaf so both shelling adapters use one copy, and clean the git branch name with it — `internal/safetext`, `internal/git/git.go`, `internal/claude` · R19
+  - Verification: `go test ./internal/safetext`, `TestAHostileBranchNameCannotDriveTheTerminal`, and `TestSharedHelpersStayLeaves` with `safetext` added to the helper list. Rounds 1 and 2 both dismissed the branch as safe because git rejects control characters in ref names; that is true of ASCII controls and false of U+202E, which `git branch` accepts and `rev-parse` returns verbatim — confirmed against the installed git before fixing.
+- [x] 9.8 Compare the detached-HEAD sentinel before cleaning, so cleaning cannot manufacture it — `internal/git/git.go` · infra
+  - Verification: `TestACleanedNameCannotImpersonateDetachedHEAD`
+- [x] 9.9 Keep the U+202E rationale in one place and rename the test file left pointing at a deleted symbol — `internal/git`, `internal/safetext`, `internal/claude/foreign_text_test.go` · infra
+  - Verification: `make lint`, `make test`; the explanation now lives only in `safetext`, with each call site keeping its own decision
+
+## 10. Wrap-up
+
+- [x] 10.1 End-to-end verification with real parallel sessions: status, cost and freshness · R1, R13, R15
   - Verification: manual run against live agent sessions
-- [x] 9.2 Confirm no network request originates from transcript content · R12
+- [x] 10.2 Confirm no network request originates from transcript content · R12
   - Verification: archtest rule that nothing reaches the network
-- [x] 9.3 Document in the README what musem is, what it observes and how to run it — `README.md` · infra
+- [x] 10.3 Document in the README what musem is, what it observes and how to run it — `README.md` · infra
   - Verification: a reader can build and run musem from the README alone
 
 ## Final validation

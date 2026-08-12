@@ -161,6 +161,21 @@ that lets that source drive the terminal.
 - **WHEN** the dashboard draws it
 - **THEN** the sequences are gone and the readable part of the value survives
 
+#### Scenario: A crafted identifier
+
+- **GIVEN** a discovery record whose session identifier contains control
+  characters
+- **WHEN** the inventory is refreshed
+- **THEN** the record is refused and counted among those that could not be read,
+  rather than having its identifier rewritten
+
+Stripping is right for text that exists to be read and wrong for a value that
+exists to be matched. An identifier is the key the inventory is indexed by and
+the name the usage record is looked up under, so a stripped identifier would
+designate a session that does not exist and a record that cannot be found — and
+two identifiers differing only in control characters would collapse into one
+session, which is the confusion R2 exists to prevent.
+
 ### R20 · An unreadable record is reported, not silently dropped
 
 **Capability**: `session-registry`

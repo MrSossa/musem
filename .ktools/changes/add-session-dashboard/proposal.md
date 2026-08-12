@@ -71,25 +71,25 @@ No capability is modified or removed: the project has no prior specs.
 
 The change is done when:
 
-- [ ] Sessions started outside musem appear in the inventory on the next refresh
+- [x] Sessions started outside musem appear in the inventory on the next refresh
       cycle, keyed by stable identifier rather than title or path (R1, R2).
-- [ ] A session blocked on a user confirmation reads as "waiting" and not as
+- [x] A session blocked on a user confirmation reads as "waiting" and not as
       "idle", and an ambiguous signal reads as indeterminate rather than as a
       guess (R3).
-- [ ] Per-session tokens and cost come from the recorded `usage`, with
+- [x] Per-session tokens and cost come from the recorded `usage`, with
       cache-creation and cache-read tokens priced separately from ordinary input
       (R7, R8).
-- [ ] A model missing from the rate table yields accounted tokens and a cost
+- [x] A model missing from the rate table yields accounted tokens and a cost
       explicitly marked unavailable, never another model's rate (R9).
-- [ ] Cost history survives closing and reopening musem, and survives deletion
+- [x] Cost history survives closing and reopening musem, and survives deletion
       of the transcript it was derived from (R11).
-- [ ] The dashboard shows every known session with name, status, directory,
+- [x] The dashboard shows every known session with name, status, directory,
       branch and cost, ordering sessions waiting on the user first (R13, R14).
-- [ ] Stale data is visibly distinguishable from current data, with an
+- [x] Stale data is visibly distinguishable from current data, with an
       indication of since when (R15).
-- [ ] No operation reachable from the interface alters a session or the
+- [x] No operation reachable from the interface alters a session or the
       repository (R16).
-- [ ] `make build`, `make test`, `make lint` and `make vet` pass on macOS and
+- [x] `make build`, `make test`, `make lint` and `make vet` pass on macOS and
       Linux with `CGO_ENABLED=0`.
 
 ## Risks and assumptions

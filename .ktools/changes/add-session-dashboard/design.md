@@ -36,6 +36,7 @@ internal/
 ├── git/                   adapter: branch resolution by shelling out
 ├── inmem/                 adapter: fake sessions for development and tests
 ├── execx/                 helper: bounded subprocesses, a leaf by rule
+├── safetext/              helper: strips terminal instructions from foreign text
 ├── registry/              orchestration: discovery, lifecycle, staleness
 ├── cost/                  orchestration: rates, computation, aggregation
 ├── app/                   composer: joins registry + cost into one snapshot
@@ -340,9 +341,12 @@ dashboard quietly.
 
 ### D15 · Foreign text is stripped where it becomes a musem value
 
-**Chosen**: control characters are removed from session names, directories and
-model identifiers in the `claude` adapter, at the point the foreign payload
-becomes a `musem` type.
+**Chosen**: control characters are removed from foreign text at the point the
+payload becomes a `musem` type — session names, directories and model
+identifiers in the `claude` adapter, branch names in `git`. The mechanism is
+`internal/safetext`, a leaf on the same terms as `execx` (D16), because the
+moment a second adapter needed it, a copy in each was a security predicate
+maintained twice.
 
 **Rejected alternatives**: escaping in the renderer. The dashboard is not the
 only consumer a value can reach, and a defence in the view has to be repeated by
@@ -350,10 +354,22 @@ every future view; one at the boundary holds for all of them. Also rejected:
 replacing stripped characters with a substitution glyph, which would let a
 crafted name masquerade as a legitimately odd one.
 
+Also rejected: stripping identifiers. Cleaning suits text that exists to be read
+and ruins a value that exists to be matched — a stripped session id designates a
+session nobody has and a transcript file that cannot be opened, and two ids
+differing only in control characters collapse into one. Identifiers are therefore
+refused and counted among the records a pass could not use.
+
 **Consequences**: a name is no longer byte-identical to what the source reported.
 That is the trade, and it is the right way round — the dashboard redraws every
 refresh, so a name carrying an escape sequence is an instruction re-issued to the
 terminal continuously, not a one-off glitch.
+
+The filter is `unicode.IsPrint`, and deliberately wider than "control bytes":
+git refuses a ref name containing an ASCII control character but accepts one
+containing U+202E, so a direction override that reorders the branch column is a
+name a repository can genuinely carry. Two earlier review rounds waved the branch
+through on the assumption that git's own validation covered it.
 
 **Requirements it supports**: R19
 
