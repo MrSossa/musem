@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/MrSossa/musem"
+	"github.com/MrSossa/musem/internal/safetext"
 )
 
 // transcriptLine is the subset of a JSONL entry musem cares about. A transcript
@@ -347,7 +348,7 @@ func scanUsage(rd io.Reader) (usage []musem.ModelUsage, skipped int, consumed in
 		// Sanitised for the same reason session names are: an unpriced model is
 		// named on screen so the user can close the gap, which puts a string
 		// from a foreign file straight into the view.
-		usage = append(usage, musem.ModelUsage{Model: sanitise(entry.Message.Model), Usage: mu, At: at})
+		usage = append(usage, musem.ModelUsage{Model: safetext.Clean(entry.Message.Model), Usage: mu, At: at})
 	}
 }
 

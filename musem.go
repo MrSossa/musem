@@ -134,8 +134,10 @@ type Discovery struct {
 	// Sessions is what the pass could read.
 	Sessions []Session
 
-	// Skipped counts records passed over because they could not be understood.
-	// Non-zero means the inventory beside it is incomplete and must say so.
+	// Skipped counts records passed over because they could not be understood,
+	// or were understood and could not be used — an identifier musem cannot key
+	// on is as unusable as a field it cannot decode. Non-zero means the
+	// inventory beside it is incomplete and must say so.
 	Skipped int
 }
 

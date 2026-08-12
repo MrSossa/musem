@@ -153,8 +153,6 @@ func errorMessage(code, message string) string {
 		return "Not found — " + message
 	case musem.EUNPARSEABLE:
 		return "Unrecognised data — " + message
-	case musem.EUNKNOWNMODEL:
-		return "Unpriced model — " + message
 	default:
 		return message
 	}
@@ -459,13 +457,19 @@ func (m Model) renderHeader(width int) string {
 		b.WriteString("\n")
 	}
 	if n := m.snapshot.Undiscovered; n > 0 {
-		// Its own line, above the table rather than beside a row, because the
-		// sessions it counts have no row: they were dropped before anything
-		// could be shown about them. Without it, a source whose record shape
-		// changed empties the list and every session left in the registry reads
-		// as one that ended — a screen full of confident, wrong statuses.
+		// Its own line, above the table rather than beside a row, because it
+		// speaks for sessions that have no row to sit beside.
+		//
+		// It names both consequences, because a dropped record has two. A
+		// session never seen before is simply absent from the list. One the
+		// registry already knew keeps its row and its last observed status,
+		// frozen: the registry refuses to call it ended on the strength of a
+		// pass that admits it could not read everything, which is right, but it
+		// leaves a status on screen that nothing refreshed. Saying only
+		// "missing" would account for the first and quietly present the second
+		// as current.
 		b.WriteString(styleStale.Render(padWide(fmt.Sprintf(
-			"  ! %d session records could not be read; sessions may be missing from this list", n), width)))
+			"  ! %d session records could not be read; sessions may be missing or stale", n), width)))
 		b.WriteString("\n")
 	}
 	b.WriteString("\n")

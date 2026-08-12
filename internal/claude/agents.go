@@ -16,6 +16,7 @@ import (
 
 	"github.com/MrSossa/musem"
 	"github.com/MrSossa/musem/internal/execx"
+	"github.com/MrSossa/musem/internal/safetext"
 )
 
 // agentRecord mirrors one entry of `claude agents --json`. Unknown fields are
@@ -97,11 +98,19 @@ func (d *Discoverer) Discover(ctx context.Context) (musem.Discovery, error) {
 
 // firstLine returns the first non-empty line of s, bounded so a CLI that writes
 // a stack trace to stderr cannot push the rest of the interface off the screen.
+//
+// The text is sanitised for the same reason session names and directories are:
+// it is written by another program and it reaches the terminal, where an escape
+// sequence is an instruction rather than a glyph. It is the likelier vector of
+// the two, not the rarer one — a CLI reporting a failure tends to quote the
+// input that caused it, and the inputs here are working directories that may
+// come from a repository nobody vetted. It is also drawn on every frame for as
+// long as discovery keeps failing.
 func firstLine(s string) string {
 	const maxDetail = 200
 
 	for _, line := range strings.Split(s, "\n") {
-		line = strings.TrimSpace(line)
+		line = safetext.Clean(strings.TrimSpace(line))
 		if line == "" {
 			continue
 		}
@@ -150,10 +159,27 @@ func parseAgents(data []byte) (musem.Discovery, error) {
 			out.Skipped++
 			continue
 		}
+		if safetext.HasUnprintable(r.SessionID) {
+			// Dropped rather than stripped, which is the opposite of what every
+			// other foreign string in this function gets — because an identifier
+			// is not display text. This value is the key the registry indexes
+			// by and the name the transcript is looked up under
+			// (`<sessionId>.jsonl`), so stripping it would point musem at a file
+			// that does not exist and quietly give the session a different
+			// identity from the one its source uses. Two ids differing only in
+			// control bytes would collapse into one session, which is precisely
+			// what keying on a stable identifier exists to prevent.
+			//
+			// So it is counted with the rest of what could not be read. A record
+			// whose identifier is unusable is a record musem cannot place, and
+			// saying so is better than placing it wrongly.
+			out.Skipped++
+			continue
+		}
 		s := musem.Session{
 			ID:       r.SessionID,
-			Name:     sanitise(r.Name),
-			Dir:      sanitise(r.CWD),
+			Name:     safetext.Clean(r.Name),
+			Dir:      safetext.Clean(r.CWD),
 			Status:   mapStatus(r.Status),
 			PID:      r.PID,
 			LastSeen: now,

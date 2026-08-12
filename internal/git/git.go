@@ -14,6 +14,7 @@ import (
 
 	"github.com/MrSossa/musem"
 	"github.com/MrSossa/musem/internal/execx"
+	"github.com/MrSossa/musem/internal/safetext"
 )
 
 // BranchResolver reports the branch checked out in a directory.
@@ -92,10 +93,23 @@ func (r *BranchResolver) Branch(ctx context.Context, dir string) (string, error)
 		return "", musem.Wrap(err, musem.EUNAVAILABLE, "cannot run git in %s", dir)
 	}
 
-	branch := strings.TrimSpace(res.Stdout)
-	if branch == "HEAD" {
+	// Cleaned rather than refused, unlike a session identifier: a branch is a
+	// label musem displays and never matches on, so the readable part of a
+	// strange name is worth more than nothing at all. What counts as needing
+	// cleaning, and why git's own ref validation does not settle it, is
+	// safetext's to explain.
+	raw := strings.TrimSpace(res.Stdout)
+	if raw == "HEAD" {
 		// Detached HEAD: there is no branch, and saying "HEAD" would read as one.
+		//
+		// Compared before cleaning, not after. git only ever writes this sentinel
+		// itself — it refuses to create a ref actually named HEAD — so the raw
+		// value is the honest place to look for it. Cleaning first would let a
+		// branch named with characters that get stripped, "H<zero-width>EAD",
+		// arrive at the comparison as the sentinel and be reported as no branch
+		// at all: the defence would have manufactured the very value it is
+		// testing for.
 		return "", nil
 	}
-	return branch, nil
+	return safetext.Clean(raw), nil
 }

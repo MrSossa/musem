@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,5 +144,51 @@ func TestATruncatedAnswerIsNotReportedAsABranch(t *testing.T) {
 	}
 	if branch != "" {
 		t.Errorf("branch = %q, want empty", branch)
+	}
+}
+
+// A branch name is chosen by whoever created the branch, and git's own ref
+// validation does not make it safe to draw — see safetext. What this asserts is
+// that the adapter routes the name through that defence at all.
+func TestAHostileBranchNameCannotDriveTheTerminal(t *testing.T) {
+	r := &BranchResolver{
+		Bin:     fakeGit(t, "printf 'feat/\\342\\200\\256niam\\n'"),
+		Timeout: 5 * time.Second,
+	}
+
+	branch, err := r.Branch(context.Background(), "/some/dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsRune(branch, '\u202e') {
+		t.Errorf("branch = %q still carries the direction override", branch)
+	}
+	// Cleaned, not refused: a branch is a label, and the readable part of an odd
+	// name is worth more than an empty column.
+	if !strings.Contains(branch, "feat/") {
+		t.Errorf("branch = %q lost the name it was meant to keep", branch)
+	}
+}
+
+// Cleaning must not be able to produce the detached-HEAD sentinel. A branch
+// named with characters the cleaner strips would otherwise arrive at the
+// comparison as "HEAD" and be reported as no branch at all — the defence
+// manufacturing the value it tests for, and blanking a column instead of
+// showing a name.
+func TestACleanedNameCannotImpersonateDetachedHEAD(t *testing.T) {
+	r := &BranchResolver{
+		Bin:     fakeGit(t, "printf 'H\\342\\200\\213EAD\\n'"),
+		Timeout: 5 * time.Second,
+	}
+
+	branch, err := r.Branch(context.Background(), "/some/dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch == "" {
+		t.Error("a branch whose name merely cleans to HEAD was reported as a detached head")
+	}
+	if branch != "HEAD" {
+		t.Errorf("branch = %q, want the cleaned name", branch)
 	}
 }

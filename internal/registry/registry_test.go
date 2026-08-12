@@ -211,8 +211,10 @@ func TestStatusSinceSurvivesRefreshesAndResetsOnChange(t *testing.T) {
 }
 
 // A pass that read none of the records it found looks exactly like a pass over a
-// machine with nothing running — and the registry answers the second by marking
-// every session ended. The count is what separates them.
+// machine with nothing running. The count is what separates them — and the
+// separation has to reach the session, not only the banner: a running session
+// displayed as "ended" is a session the user stops looking at, which is the
+// whole harm the count exists to prevent.
 func TestUnreadableRecordsAreReportedRatherThanReadAsAnEmptyMachine(t *testing.T) {
 	d := &fakeDiscoverer{sessions: []musem.Session{session("a", "alpha", "/p/alpha", musem.StatusRunning)}}
 	r := New(d, fakeBranches{})
@@ -231,6 +233,58 @@ func TestUnreadableRecordsAreReportedRatherThanReadAsAnEmptyMachine(t *testing.T
 	if snap.Stale || snap.ErrCode != "" {
 		t.Errorf("stale = %v, code = %q; a successful pass that dropped records is neither stale nor failed",
 			snap.Stale, snap.ErrCode)
+	}
+	if len(snap.Sessions) != 1 {
+		t.Fatalf("got %d sessions, want the known one kept", len(snap.Sessions))
+	}
+	if got := snap.Sessions[0]; got.Ended() || got.Status != musem.StatusRunning {
+		t.Errorf("session = {status %s, ended %v}, want it left running: a pass that could not read "+
+			"its records has not established that anything is absent", got.Status, got.Ended())
+	}
+}
+
+// The guard is about what the pass could not read, not about how many sessions
+// it happened to return. A pass that dropped one record of several must not end
+// the sessions missing from the rest either — the dropped record is exactly
+// where they might have been.
+func TestAPartiallyReadPassEndsNothing(t *testing.T) {
+	d := &fakeDiscoverer{sessions: []musem.Session{
+		session("a", "alpha", "/p/alpha", musem.StatusRunning),
+		session("b", "beta", "/p/beta", musem.StatusIdle),
+	}}
+	r := New(d, fakeBranches{})
+	r.Refresh(context.Background())
+
+	d.sessions, d.skipped = []musem.Session{session("a", "alpha", "/p/alpha", musem.StatusRunning)}, 1
+	r.Refresh(context.Background())
+
+	for _, s := range r.Snapshot().Sessions {
+		if s.Ended() {
+			t.Errorf("session %s was ended by an incomplete pass", s.ID)
+		}
+	}
+}
+
+// The guard must not become a way for sessions never to end. Once a pass reads
+// everything it found, absence means what it always meant.
+func TestACleanPassAfterADegradedOneStillEnds(t *testing.T) {
+	d := &fakeDiscoverer{sessions: []musem.Session{session("a", "alpha", "/p/alpha", musem.StatusRunning)}}
+	r := New(d, fakeBranches{})
+	r.Refresh(context.Background())
+
+	d.sessions, d.skipped = nil, 1
+	r.Refresh(context.Background())
+
+	d.skipped = 0
+	r.Refresh(context.Background())
+
+	sessions := r.Snapshot().Sessions
+	if len(sessions) != 1 {
+		t.Fatalf("got %d sessions, want the known one kept", len(sessions))
+	}
+	if !sessions[0].Ended() || sessions[0].Status != musem.StatusEnded {
+		t.Errorf("session = {status %s, ended %v}, want it ended once a complete pass reported it gone",
+			sessions[0].Status, sessions[0].Ended())
 	}
 }
 

@@ -21,15 +21,17 @@ const (
 	// EUNAVAILABLE is a source that could not be reached or is not installed.
 	// The dashboard stays up and says so rather than failing.
 	EUNAVAILABLE = "unavailable"
-	// ESTALE is data that is being served past its freshness window. It is not
-	// a failure: it is a fact the user must be able to see.
-	ESTALE = "stale"
-	// EUNKNOWNMODEL is usage from a model with no known rate. Tokens are still
-	// counted; only the cost is unavailable.
-	EUNKNOWNMODEL = "unknown_model"
 	// EUNPARSEABLE is a foreign payload whose shape musem does not recognise.
 	EUNPARSEABLE = "unparseable"
 )
+
+// Staleness and unpriced models deliberately have no code here. Both were
+// codes once, and neither is a failure: data served past its freshness window
+// is reported by registry.Snapshot's Stale and Age, and usage from a model with
+// no known rate by SessionCost.UnknownModels beside a Cost that knows it is
+// unknown. Both are facts a snapshot carries about itself, and an error is the
+// wrong shape for a fact — it can only be raised instead of the answer, not
+// alongside it.
 
 // Error is an application error carrying a code and a human-readable message.
 type Error struct {

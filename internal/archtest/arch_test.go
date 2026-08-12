@@ -29,7 +29,7 @@ var orchestration = []string{"registry", "cost"}
 
 // helpers wrap a piece of the standard library that is easy to get wrong, and
 // nothing else. They know no musem type and no musem package.
-var helpers = []string{"execx"}
+var helpers = []string{"execx", "safetext"}
 
 // TestRootPackageImportsNothingExternal is the load-bearing rule. The domain
 // sits at the centre precisely because it depends on nobody; the moment it

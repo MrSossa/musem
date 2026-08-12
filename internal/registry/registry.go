@@ -274,23 +274,40 @@ func (r *Registry) Refresh(ctx context.Context) {
 
 	// Anything that stopped appearing has ended. It is marked and kept, never
 	// dropped: its accumulated cost has to remain reachable.
-	for id, s := range r.sessions {
-		if seen[id] || s.Ended() {
-			continue
+	//
+	// Only a pass that read everything it found may draw that conclusion. Ending
+	// a session is an inference from absence, and a pass that admits it could not
+	// read some of its records has not established that anything is absent — the
+	// session may well have been sitting in one of them. Acting on it anyway is
+	// how a field changing type turns a whole fleet of running sessions into a
+	// wall of finished ones, confidently and with nothing on screen tying the two
+	// together.
+	//
+	// The cost of waiting is that a session which genuinely ended during a
+	// degraded pass keeps showing as live until a clean one arrives. That is the
+	// direction to err in: a finished session shown as live for one cycle is
+	// noise, a live session shown as finished is a session the user stops
+	// looking at.
+	if discovery.Skipped == 0 {
+		for id, s := range r.sessions {
+			if seen[id] || s.Ended() {
+				continue
+			}
+			endedAt := s.LastSeen
+			if endedAt.IsZero() {
+				endedAt = now
+			}
+			s.EndedAt = &endedAt
+			// Ended, not dead. Disappearing from discovery is how a session
+			// finishes normally; dead is a verdict the source has to pronounce,
+			// and inferring it here would label every cleanly closed session a
+			// failure.
+			if s.Status != musem.StatusDead {
+				s.Status = musem.StatusEnded
+				s.StatusSince = now
+			}
+			r.sessions[id] = s
 		}
-		endedAt := s.LastSeen
-		if endedAt.IsZero() {
-			endedAt = now
-		}
-		s.EndedAt = &endedAt
-		// Ended, not dead. Disappearing from discovery is how a session finishes
-		// normally; dead is a verdict the source has to pronounce, and inferring
-		// it here would label every cleanly closed session a failure.
-		if s.Status != musem.StatusDead {
-			s.Status = musem.StatusEnded
-			s.StatusSince = now
-		}
-		r.sessions[id] = s
 	}
 
 	r.updatedAt = now
@@ -381,11 +398,15 @@ func (r *Registry) Snapshot() Snapshot {
 	sort.Slice(sessions, func(i, j int) bool {
 		a, b := sessions[i], sessions[j]
 		// A session that has ended sorts below every live one, whatever its
-		// status says. Ended sessions are marked dead and never dropped, and
-		// dead outranks running — so without this, an afternoon of short
-		// sessions buries the one session actually working behind a wall of
-		// finished ones. Nothing that has stopped is competing for attention
-		// with something that has not.
+		// status says.
+		//
+		// StatusEnded already ranks last on its own, so this guard is not about
+		// the ordinary case. It is about the session the source itself called
+		// dead before it disappeared: that verdict is preserved rather than
+		// softened to ended, and StatusDead outranks running — so without this,
+		// an afternoon of sessions that failed and went away buries the one
+		// session actually working behind a wall of finished ones. Nothing that
+		// has stopped is competing for attention with something that has not.
 		if a.Ended() != b.Ended() {
 			return b.Ended()
 		}

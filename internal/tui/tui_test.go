@@ -950,6 +950,14 @@ func TestUnreadableSessionRecordsAreAnnounced(t *testing.T) {
 	if !strings.Contains(view, "2 session records could not be read") {
 		t.Errorf("the dropped records were not announced:\n%s", view)
 	}
+	// Both consequences, not just the obvious one. A record the registry had
+	// never seen leaves a session missing; one it already knew leaves a row
+	// frozen at its last observed status, because the registry will not call a
+	// session ended on a pass that could not read everything. Announcing only
+	// "missing" presents that frozen row as current.
+	if !strings.Contains(view, "missing or stale") {
+		t.Errorf("the warning accounts for absent sessions but not for frozen ones:\n%s", view)
+	}
 
 	// And it says nothing when there is nothing to say: a warning that is always
 	// on screen is one nobody reads.
