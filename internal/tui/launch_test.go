@@ -792,3 +792,43 @@ func TestTheLaunchReportCannotDriveTheTerminal(t *testing.T) {
 		t.Errorf("the report lost the session it was announcing:\n%s", view)
 	}
 }
+
+// R32, R33: leaving the form while a launch is in flight must not lose the
+// report.
+//
+// The form invites it — while a launch runs, esc is the only key it takes, and
+// the hint says "leave this running and go back". Doing exactly that used to
+// close the form, and the outcome then arrived to a nil form and was dropped: a
+// session that started, and nothing on screen about it. That is precisely the
+// case the report exists for, reached by doing what the interface suggested.
+func TestLeavingTheFormDoesNotLoseTheReport(t *testing.T) {
+	l := newFakeLauncher()
+	l.outcome = launchedInto("abc123", "musem/session-1", "/r/api-musem-session-1")
+
+	m := key(t, dashboard(t, l), "n")
+
+	// Confirm without running the command: the launch is in flight.
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("confirming produced no command")
+	}
+
+	// The user takes the way out the form offers.
+	m = key(t, m, "esc")
+	if m.form != nil {
+		t.Fatal("esc did not leave the form")
+	}
+
+	// The launch finishes afterwards.
+	after, _ := m.Update(cmd())
+	m = after.(Model)
+
+	if len(m.launched) != 1 {
+		t.Fatalf("launched = %+v; a session that started was never reported", m.launched)
+	}
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "tmux attach -t musem-abc123") {
+		t.Errorf("the started session is not on screen:\n%s", view)
+	}
+}

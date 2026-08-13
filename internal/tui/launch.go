@@ -254,16 +254,20 @@ func (m Model) updateForm(msg tea.Msg) (Model, tea.Cmd, bool) {
 		return m, nil, true
 
 	case LaunchedMsg:
-		if m.form == nil {
-			return m, nil, true
-		}
+		// Deliberately not guarded on the form still being open. While a launch
+		// is in flight the form takes one key, and the hint offers it: "esc
+		// leave this running and go back". A user who does exactly that arrives
+		// here with no form — and dropping the outcome on that basis loses the
+		// report for a session that started, which is the one case it exists
+		// for, reached by doing what the interface suggested.
 		if msg.Err != nil {
-			// Nothing is announced as started, because nothing was. The form
-			// stays open holding the reason, which is where the user can act on
-			// it.
-			f := *m.form
-			f.launching, f.failed = false, musem.ErrorMessage(msg.Err)
-			m.form = &f
+			// Nothing is announced as started, because nothing was. The reason
+			// goes back to the form when there is still a form to hold it.
+			if m.form != nil {
+				f := *m.form
+				f.launching, f.failed = false, musem.ErrorMessage(msg.Err)
+				m.form = &f
+			}
 			return m, nil, true
 		}
 
@@ -280,6 +284,9 @@ func (m Model) updateForm(msg tea.Msg) (Model, tea.Cmd, bool) {
 		copy(next, m.launched)
 		m.launched = append(next, msg.Outcome)
 
+		// Closing a form that is already closed is a no-op, which is what makes
+		// the two ways of getting here — confirming and waiting, or confirming
+		// and leaving — end in the same place.
 		return m.closeForm(), nil, true
 	}
 	return m, nil, false
