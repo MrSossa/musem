@@ -185,7 +185,7 @@ deleted a running session's work.
 | Public API | None. musem is a binary, and the CLI gains no flag |
 | Security | The first write path. Mitigated by D4 (removal needs a recorded creation), D3 (undetermined is dirty) and R11 (nothing outside musem's own creations). Paths entered by the user reach git as argv, never a shell, as `git.go` already does for the directory it passes after `-C`. Branch names supplied by the user are foreign text on the way back out and go through `safetext` like every other rendered value |
 | Performance | Worktree creation is seconds on a large repository and runs off the UI goroutine (D6). The form's validation queries (D7) run per keystroke at worst and must be debounced or cancelled, or they will fight the refresh loop for the git binary |
-| Dependencies | tmux, at runtime, for launching only. No new Go module: the form uses `bubbles/textinput`, already an indirect dependency of the TUI stack, and everything else shells out through `execx` |
+| Dependencies | tmux, at runtime, for launching only. No new Go module: `bubbles` is not in the module graph despite reading like it should be, so the form carries a small single-line editor of its own — roughly ninety lines of rune arithmetic, against a dependency that would also bring a component, focus and styling model this package already answers itself. Everything else shells out through `execx` |
 
 ## Test plan
 

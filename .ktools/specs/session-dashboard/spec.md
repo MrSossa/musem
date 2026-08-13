@@ -1,11 +1,16 @@
 # session-dashboard
 
-The read-only view: which columns it shows, how it orders them, how often it
-refreshes, how it is navigated, and how it communicates that a value is stale or
-unavailable.
+The view: which columns it shows, how it orders them, how often it refreshes, how
+it is navigated, and how it communicates that a value is stale or unavailable.
+
+It was read-only for its whole first phase, and no longer is — launching from the
+dashboard is `session-launch`. What survives that is R31: navigating still
+changes nothing, and what the dashboard may create and remove is exactly what
+musem made for itself.
 
 Requirement ids are those the change that introduced them used, so the review
-record stays traceable; they are not contiguous.
+record stays traceable; they are not contiguous. Where a change proposed an id
+already in force elsewhere, the id it proposed is kept in parentheses.
 
 ## R13 · Fleet overview
 
@@ -53,21 +58,32 @@ value with the same appearance as a current one.
 - **WHEN** refresh fails or stops completing
 - **THEN** the affected data is visibly marked as stale, indicating since when
 
-## R16 · Read only
+## R31 · Destructive actions are narrow, recorded and explained (R11)
 
-Within this scope the dashboard SHALL limit itself to observing. It SHALL NOT
-send input to a session, create, stop or restart one, nor modify a session's
-state, a repository, or any file outside musem's own history store.
+Replaces R16, whose read-only guarantee ended when launching arrived. R16 was a
+first-phase constraint that forced observation to be solved before acting on what
+is observed, and it did its job. What is worth keeping from it — navigation never
+mutates, and nothing outside musem's own creations is ever touched — is stated
+here, narrower and enforceable alongside launching.
 
-The store is the one exception, and a narrow one: R11 requires history to
-survive a restart, which cannot be done without writing somewhere. Everything
-the user is observing stays untouched.
+The dashboard MAY create and remove only what this specification permits: the
+worktrees it makes for the sessions it launches. Every other object the user is
+observing — sessions musem did not launch, repositories, working directories,
+files outside musem's own store and worktrees musem did not create — SHALL remain
+untouched. No action reachable by navigating the interface SHALL modify anything;
+mutation SHALL follow only from an action the user asked for explicitly.
 
-### Scenario: No destructive actions available
+### Scenario: Navigating changes nothing
 
 - **GIVEN** the dashboard open with live sessions
-- **WHEN** the user navigates the interface
-- **THEN** they find no operation that alters a session or the repository
+- **WHEN** the user moves through the list, opens details and reads help
+- **THEN** nothing on disk and no session has changed
+
+### Scenario: Someone else's repository
+
+- **GIVEN** a session observed in a repository musem never launched into
+- **WHEN** that session ends, however it ends
+- **THEN** that repository and its worktrees are exactly as they were
 
 ## R17 · Keyboard navigation
 
