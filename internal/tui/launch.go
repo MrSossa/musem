@@ -254,17 +254,39 @@ func (m Model) updateForm(msg tea.Msg) (Model, tea.Cmd, bool) {
 		return m, nil, true
 
 	case LaunchedMsg:
-		if m.form == nil {
-			return m, nil, true
-		}
+		// Deliberately not guarded on the form still being open. While a launch
+		// is in flight the form takes one key, and the hint offers it: "esc
+		// leave this running and go back". A user who does exactly that arrives
+		// here with no form — and dropping the outcome on that basis loses the
+		// report for a session that started, which is the one case it exists
+		// for, reached by doing what the interface suggested.
 		if msg.Err != nil {
-			f := *m.form
-			f.launching, f.failed = false, musem.ErrorMessage(msg.Err)
-			m.form = &f
+			// Nothing is announced as started, because nothing was. The reason
+			// goes back to the form when there is still a form to hold it.
+			if m.form != nil {
+				f := *m.form
+				f.launching, f.failed = false, musem.ErrorMessage(msg.Err)
+				m.form = &f
+			}
 			return m, nil, true
 		}
-		// R5: the session joins the inventory on the next discovery pass, so the
-		// form's work is done and the dashboard is where the result shows up.
+
+		// The form's work is done, but the dashboard has nothing to show yet:
+		// discovery runs on its own interval, and an agent that asks to be let
+		// into a directory before it starts will wait in its pane until somebody
+		// answers. Closing on silence is what made a successful launch look like
+		// a keypress that did nothing.
+		//
+		// Appended to a fresh slice rather than in place: the model arrives here
+		// by value, and appending under a shared backing array would write into
+		// the copy bubbletea is holding.
+		next := make([]musem.LaunchOutcome, len(m.launched), len(m.launched)+1)
+		copy(next, m.launched)
+		m.launched = append(next, msg.Outcome)
+
+		// Closing a form that is already closed is a no-op, which is what makes
+		// the two ways of getting here — confirming and waiting, or confirming
+		// and leaving — end in the same place.
 		return m.closeForm(), nil, true
 	}
 	return m, nil, false

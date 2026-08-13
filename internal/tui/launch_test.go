@@ -585,3 +585,250 @@ func TestLaunchingIsNotOfferedWithoutALauncher(t *testing.T) {
 		t.Error("a form opened with nothing behind it")
 	}
 }
+
+// launchedInto returns an outcome shaped like a real one for the fake to return.
+func launchedInto(id, branch, dir string) musem.LaunchOutcome {
+	out := musem.LaunchOutcome{
+		SessionID: id,
+		Substrate: "musem-" + id,
+		Dir:       dir,
+		Branch:    branch,
+	}
+	if branch != "" {
+		out.Worktree = dir
+	}
+	return out
+}
+
+// launchAndSettle presses n, confirms, and returns the dashboard afterwards.
+func launchAndSettle(t *testing.T, l *fakeLauncher) Model {
+	t.Helper()
+	m := key(t, dashboard(t, l), "n")
+	return key(t, m, "enter")
+}
+
+// R32, scenario "A session in a worktree": what was started is named — where it
+// is, what it is on, and how to reach it.
+func TestASuccessfulLaunchSaysWhatItStarted(t *testing.T) {
+	l := newFakeLauncher()
+	l.outcome = launchedInto("abc123", "musem/session-1", "/r/api-musem-session-1")
+
+	m := launchAndSettle(t, l)
+	if m.form != nil {
+		t.Fatal("the form is still open after a successful launch")
+	}
+
+	view := stripANSI(m.View())
+	for _, want := range []string{
+		"musem-abc123",                // the name it is hosted under
+		"musem/session-1",             // the branch
+		"/r/api-musem-session-1",      // where it is working
+		"tmux attach -t musem-abc123", // how to get a terminal in it
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("the report does not mention %q:\n%s", want, view)
+		}
+	}
+}
+
+// R32, scenario "A session without a worktree": the directory as it was given,
+// and no branch invented for a launch that made none.
+func TestALaunchWithoutAWorktreeIsReportedWithoutOne(t *testing.T) {
+	l := newFakeLauncher()
+	l.outcome = launchedInto("abc123", "", "/home/u/project")
+
+	m := launchAndSettle(t, l)
+	view := stripANSI(m.View())
+
+	if !strings.Contains(view, "/home/u/project") {
+		t.Errorf("the directory is not reported:\n%s", view)
+	}
+	if !strings.Contains(view, "tmux attach -t musem-abc123") {
+		t.Errorf("the way to reach it is not reported:\n%s", view)
+	}
+	if strings.Contains(view, " in /home/u/project") {
+		t.Errorf("a branch was implied for a launch that created none:\n%s", view)
+	}
+}
+
+// R32, scenario "A launch that failed": nothing is announced as started,
+// because nothing was.
+func TestAFailedLaunchAnnouncesNothingAsStarted(t *testing.T) {
+	l := newFakeLauncher()
+	l.launchErr = musem.Errorf(musem.EUNAVAILABLE, "tmux was not found on PATH")
+	l.outcome = launchedInto("abc123", "musem/session-1", "/r/api-musem-session-1")
+
+	m := launchAndSettle(t, l)
+
+	if len(m.launched) != 0 {
+		t.Fatalf("launched = %+v after a failure; nothing was started", m.launched)
+	}
+	if strings.Contains(stripANSI(m.View()), "started musem-abc123") {
+		t.Error("a launch that failed was announced as started")
+	}
+}
+
+// R33, scenario "The session has not appeared yet": the report stands, and says
+// so, across refreshes that do not contain it.
+//
+// This is also scenario "The agent is waiting to be let in": an agent asking to
+// be let into a directory sits in its pane until somebody answers, which from
+// the dashboard's side looks exactly like this — and the answer is to attach.
+func TestAReportStandsWhileTheSessionIsAbsent(t *testing.T) {
+	l := newFakeLauncher()
+	l.outcome = launchedInto("abc123", "musem/session-1", "/r/api-musem-session-1")
+
+	m := launchAndSettle(t, l)
+
+	// Several refreshes go by carrying somebody else's sessions.
+	for i := 0; i < 5; i++ {
+		m = withSnapshot(m, snapshot(row("other", "other", musem.StatusRunning)))
+	}
+
+	if len(m.launched) != 1 {
+		t.Fatalf("the report was withdrawn while the session was still absent: %+v", m.launched)
+	}
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "not in the inventory yet") {
+		t.Errorf("the report does not say the session has not appeared:\n%s", view)
+	}
+	if !strings.Contains(view, "tmux attach -t musem-abc123") {
+		t.Errorf("the report stopped saying how to reach it:\n%s", view)
+	}
+}
+
+// R33, scenario "The session appears": the report is withdrawn on its own once
+// the session is in the inventory, where it has a row like any other.
+func TestAReportIsWithdrawnWhenTheSessionArrives(t *testing.T) {
+	l := newFakeLauncher()
+	l.outcome = launchedInto("abc123", "musem/session-1", "/r/api-musem-session-1")
+
+	m := launchAndSettle(t, l)
+	if len(m.launched) != 1 {
+		t.Fatalf("nothing was reported: %+v", m.launched)
+	}
+
+	m = withSnapshot(m, snapshot(
+		row("other", "other", musem.StatusRunning),
+		row("abc123", "api", musem.StatusRunning),
+	))
+
+	if len(m.launched) != 0 {
+		t.Fatalf("the report outlived the session's arrival: %+v", m.launched)
+	}
+	if strings.Contains(stripANSI(m.View()), "not in the inventory yet") {
+		t.Error("the dashboard still says the session has not appeared")
+	}
+}
+
+// R33, scenario "More launches than there is room for": the ones that do not
+// fit are counted rather than drawn, and the header stays a header.
+func TestManyOutstandingLaunchesAreCountedRatherThanDrawn(t *testing.T) {
+	m := NewModel(WithLauncher(newFakeLauncher()))
+	m.width, m.height = 100, 30
+	for i := 0; i < 5; i++ {
+		id := string(rune('a' + i))
+		m.launched = append(m.launched, launchedInto(id, "musem/session-1", "/r/api-"+id))
+	}
+	m = withSnapshot(m, snapshot(row("other", "other", musem.StatusIdle)))
+
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "and 3 more launched sessions have not appeared yet") {
+		t.Errorf("the outstanding launches are not accounted for:\n%s", view)
+	}
+	if strings.Count(view, "tmux attach") > maxLaunchNotices {
+		t.Errorf("more than %d reports were drawn in full:\n%s", maxLaunchNotices, view)
+	}
+}
+
+// R32, R33: the report is held to the same width discipline as the rest of the
+// header. A line that wraps costs a terminal row View budgeted by counting
+// newlines, and the fleet total goes off the top of the screen.
+func TestTheLaunchReportStaysInsideANarrowTerminal(t *testing.T) {
+	long := "/home/a/very/long/path/that/keeps/going/api-musem-session-with-a-long-branch-name"
+
+	for _, width := range []int{20, 30, 40, 60, 120} {
+		m := NewModel(WithLauncher(newFakeLauncher()))
+		next, _ := m.Update(tea.WindowSizeMsg{Width: width, Height: 14})
+		m = next.(Model)
+		m.launched = []musem.LaunchOutcome{
+			launchedInto("abc123", "feat/a-branch-with-a-long-name", long),
+		}
+		m = withSnapshot(m, snapshot(row("other", "other", musem.StatusIdle)))
+
+		view := m.View()
+		for _, line := range strings.Split(view, "\n") {
+			if w := widestWidths.StringWidth(stripANSI(line)); w > width {
+				t.Errorf("at width %d a line occupies %d cells: %q", width, w, stripANSI(line))
+			}
+		}
+		if lines := strings.Count(view, "\n"); lines > 14 {
+			t.Errorf("at width %d the dashboard draws %d lines into a terminal of 14", width, lines)
+		}
+	}
+}
+
+// A path or a branch is foreign text on its way to a terminal, where an escape
+// sequence is an instruction rather than a glyph — and this line is drawn on
+// every frame for as long as the session takes to appear.
+func TestTheLaunchReportCannotDriveTheTerminal(t *testing.T) {
+	m := NewModel(WithLauncher(newFakeLauncher()))
+	m.width, m.height = 100, 24
+	m.launched = []musem.LaunchOutcome{
+		launchedInto("abc123", "feat/\u202eniam", "/r/api\x1b[2J-musem"),
+	}
+	m = withSnapshot(m, snapshot(row("other", "other", musem.StatusIdle)))
+
+	view := stripANSI(m.View())
+	if strings.ContainsRune(view, '\u202e') {
+		t.Error("the report still carries a direction override")
+	}
+	if strings.Contains(view, "\x1b[2J") {
+		t.Error("the report still carries an escape sequence")
+	}
+	// Cleaned, not refused: the readable part of an odd name is worth more than
+	// a blank line where a session should be.
+	if !strings.Contains(view, "musem-abc123") {
+		t.Errorf("the report lost the session it was announcing:\n%s", view)
+	}
+}
+
+// R32, R33: leaving the form while a launch is in flight must not lose the
+// report.
+//
+// The form invites it — while a launch runs, esc is the only key it takes, and
+// the hint says "leave this running and go back". Doing exactly that used to
+// close the form, and the outcome then arrived to a nil form and was dropped: a
+// session that started, and nothing on screen about it. That is precisely the
+// case the report exists for, reached by doing what the interface suggested.
+func TestLeavingTheFormDoesNotLoseTheReport(t *testing.T) {
+	l := newFakeLauncher()
+	l.outcome = launchedInto("abc123", "musem/session-1", "/r/api-musem-session-1")
+
+	m := key(t, dashboard(t, l), "n")
+
+	// Confirm without running the command: the launch is in flight.
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("confirming produced no command")
+	}
+
+	// The user takes the way out the form offers.
+	m = key(t, m, "esc")
+	if m.form != nil {
+		t.Fatal("esc did not leave the form")
+	}
+
+	// The launch finishes afterwards.
+	after, _ := m.Update(cmd())
+	m = after.(Model)
+
+	if len(m.launched) != 1 {
+		t.Fatalf("launched = %+v; a session that started was never reported", m.launched)
+	}
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "tmux attach -t musem-abc123") {
+		t.Errorf("the started session is not on screen:\n%s", view)
+	}
+}

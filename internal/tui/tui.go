@@ -23,6 +23,7 @@ import (
 
 	"github.com/MrSossa/musem"
 	"github.com/MrSossa/musem/internal/app"
+	"github.com/MrSossa/musem/internal/safetext"
 )
 
 // SnapshotMsg carries a new snapshot into the update loop.
@@ -41,6 +42,16 @@ type Model struct {
 	// pointer in this struct, and it is one so that "no form" is a state rather
 	// than a flag beside a value nobody should read.
 	form *form
+
+	// launched are the sessions this musem started and has not yet seen arrive
+	// in the inventory.
+	//
+	// They live here rather than travelling through app the way kept worktrees
+	// do, because a launch is something the view caused and is told about, where
+	// a reclamation happens on the registry's schedule with nobody watching.
+	// They are not persisted: this is a statement about what just happened in
+	// this run of the program, not a fact about the machine.
+	launched []musem.LaunchOutcome
 
 	// launcher is what the form calls. Nil disables launching entirely, which is
 	// what a musem with no substrate or no history store runs as: observing
@@ -113,6 +124,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case SnapshotMsg:
 		m.snapshot = msg.Snapshot
+		// A launch stops being news the moment its session is in the inventory,
+		// where it has a row like any other. Checked against every snapshot
+		// rather than timed out: an agent waiting to be let in can wait as long
+		// as the user is away, and a report that expired on a clock would take
+		// the only sign of it off the screen while it was still true.
+		m.launched = stillMissing(m.launched, msg.Snapshot.Rows)
 		// The list reorders as sessions change status, so the cursor is clamped
 		// rather than left pointing past the end.
 		if m.cursor >= len(m.snapshot.Rows) {
@@ -551,6 +568,7 @@ func (m Model) renderHeader(width int) string {
 		b.WriteString("\n")
 	}
 	b.WriteString(m.renderKept(width))
+	b.WriteString(m.renderLaunched(width))
 
 	b.WriteString("\n")
 	return b.String()
@@ -841,3 +859,91 @@ func formatTime(t time.Time) string {
 
 // max and min are the language's own builtins, available since Go 1.21 and
 // therefore not worth hand-writing here.
+
+// stillMissing returns the launches whose sessions have not turned up in rows.
+//
+// It allocates a new slice rather than filtering in place. The model is handed
+// to Update by value, so a slice trimmed under its own backing array would reach
+// back into the copy bubbletea kept.
+func stillMissing(launched []musem.LaunchOutcome, rows []Row) []musem.LaunchOutcome {
+	if len(launched) == 0 {
+		return nil
+	}
+
+	arrived := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		arrived[r.Session.ID] = true
+	}
+
+	out := make([]musem.LaunchOutcome, 0, len(launched))
+	for _, l := range launched {
+		if !arrived[l.SessionID] {
+			out = append(out, l)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// maxLaunchNotices is how many started sessions the header describes before it
+// starts counting them instead.
+//
+// Two, each costing two lines, because past that the header has stopped being a
+// header. The count that replaces them is not a lesser answer: what the user
+// needs at that point is that several launches are outstanding, not four more
+// paths.
+const maxLaunchNotices = 2
+
+// renderLaunched says what this musem started and has not yet seen arrive.
+//
+// It sits in the header, beside the kept-worktree notices, for the same reason
+// they do: it speaks for a session that has no row to sit beside. A launch that
+// succeeded and has not appeared is the case with no other evidence on screen —
+// the form has closed, the table is unchanged, and without this the user is
+// looking at proof that nothing happened.
+func (m Model) renderLaunched(width int) string {
+	if len(m.launched) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	for i, l := range m.launched {
+		if i >= maxLaunchNotices {
+			b.WriteString(styleWaiting.Render(padWide(clip(fmt.Sprintf(
+				"  ⟳ and %d more launched sessions have not appeared yet",
+				len(m.launched)-maxLaunchNotices), width), width)))
+			b.WriteString("\n")
+			break
+		}
+
+		// Where it is, on what, and under what name. The branch is absent for a
+		// launch that made no worktree, and saying "—" there would invent a
+		// distinction the user did not ask about.
+		//
+		// The path and the branch are cleaned on the way to the screen, as the
+		// same two values are in the form that produced them: the path is
+		// whatever git printed for a directory somebody else named, and the
+		// branch is a name whoever made the branch chose. The session's own name
+		// is not, because musem generated it. Drawn here for as long as the
+		// session takes to appear, which is the case that makes an escape
+		// sequence worth caring about.
+		where := safetext.Clean(l.Dir)
+		if l.Branch != "" {
+			where = safetext.Clean(l.Branch) + " in " + where
+		}
+		b.WriteString(styleWaiting.Render(padWide(clip(
+			"  ⟳ started "+l.Substrate+" — "+where, width), width)))
+		b.WriteString("\n")
+
+		// The second line is the one the user acts on, so it carries the command
+		// verbatim and says plainly that the session is not in the list below.
+		// An agent that is waiting to be let in looks exactly like this, and the
+		// way out of that is to attach.
+		b.WriteString(styleDim.Render(padWide(clip(
+			"    not in the inventory yet · tmux attach -t "+l.Substrate, width), width)))
+		b.WriteString("\n")
+	}
+	return b.String()
+}

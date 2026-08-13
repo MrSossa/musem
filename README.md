@@ -64,6 +64,26 @@ The session runs in tmux, detached, so it outlives musem: close the dashboard an
 the agent keeps working. `tmux ls` lists them — everything musem started is
 prefixed `musem-` — and `tmux attach -t <name>` gets you a terminal in it.
 
+When a launch succeeds musem says what it started, and keeps saying it until the
+session turns up in the inventory:
+
+```
+  ⟳ started musem-a1b2c3d4 — musem/session-1 in ~/projects/api-musem-session-1
+    not in the inventory yet · tmux attach -t musem-a1b2c3d4
+```
+
+That line is normal for a few seconds: discovery runs on an interval. If it
+stays, attach — the agent is almost certainly waiting for you. Claude Code asks
+before it will work in a directory it has not been trusted with, and a fresh
+worktree is by definition one of those. It puts that question in its pane and
+waits there indefinitely; answer it once and the session joins the list.
+
+Whether you see the question at all depends on where the worktree lands, because
+trust is inherited from a parent directory: a repository under a path you have
+already trusted produces worktrees that are trusted too. musem does not answer
+that question for you, and will not write to the agent tool's configuration to
+make it go away.
+
 A launch that cannot proceed says so in the form rather than half-happening — the
 directory is not a repository, the branch is already checked out somewhere else,
 the destination is taken, tmux or the Claude CLI is missing. A launch that fails
