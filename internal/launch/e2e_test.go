@@ -123,7 +123,19 @@ func repository(t *testing.T) string {
 	run(work, "branch", "feature")
 	run(work, "push", "-u", "origin", "feature")
 
-	return work
+	// Resolved, because git resolves. On macOS the temporary directory is under
+	// /var/folders, which is a symlink to /private/var/folders, so `git rev-parse
+	// --show-toplevel` answers with a path that is the same directory as the one
+	// it was handed and not the same string. Everything musem derives from a
+	// repository — the recorded root, the worktree destination — comes from git's
+	// answer rather than from what the user typed, which is what makes those
+	// values canonical and comparable. A test that compared against the
+	// unresolved path would be asserting that git echoes its input.
+	resolved, err := filepath.EvalSymlinks(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
 }
 
 // inRepo runs a git command inside a checkout and fails the test if it does not
