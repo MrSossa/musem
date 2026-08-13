@@ -775,12 +775,12 @@ func TestTheLaunchReportCannotDriveTheTerminal(t *testing.T) {
 	m := NewModel(WithLauncher(newFakeLauncher()))
 	m.width, m.height = 100, 24
 	m.launched = []musem.LaunchOutcome{
-		launchedInto("abc123", "feat/‮niam", "/r/api\x1b[2J-musem"),
+		launchedInto("abc123", "feat/\u202eniam", "/r/api\x1b[2J-musem"),
 	}
 	m = withSnapshot(m, snapshot(row("other", "other", musem.StatusIdle)))
 
 	view := stripANSI(m.View())
-	if strings.ContainsRune(view, '‮') {
+	if strings.ContainsRune(view, '\u202e') {
 		t.Error("the report still carries a direction override")
 	}
 	if strings.Contains(view, "\x1b[2J") {
