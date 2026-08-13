@@ -153,3 +153,18 @@ func Run(ctx context.Context, c Cmd) (Result, error) {
 	}
 	return res, &Error{Kind: Failed, Err: err}
 }
+
+// KindOf classifies why err was returned by Run.
+//
+// Run guarantees a non-nil error is always an *Error, so this is the unwrap that
+// every caller would otherwise write for itself — and did, in each adapter that
+// shells out, each one re-deriving a classification this package had already
+// attached. Anything unrecognised, including nil, is Failed: callers reach for
+// the kind only inside a branch they took because there was an error.
+func KindOf(err error) Kind {
+	var e *Error
+	if errors.As(err, &e) {
+		return e.Kind
+	}
+	return Failed
+}

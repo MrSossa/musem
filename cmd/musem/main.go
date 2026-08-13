@@ -1,4 +1,5 @@
-// Command musem is a read-only observatory for AI coding agent sessions.
+// Command musem is an observatory for AI coding agent sessions, and the place
+// they are started from.
 //
 // This file is the composition root: the only place that knows which adapter
 // satisfies which port. Everything is injected by constructor — there are no
@@ -25,8 +26,10 @@ import (
 	"github.com/MrSossa/musem/internal/cost"
 	"github.com/MrSossa/musem/internal/git"
 	"github.com/MrSossa/musem/internal/inmem"
+	"github.com/MrSossa/musem/internal/launch"
 	"github.com/MrSossa/musem/internal/registry"
 	"github.com/MrSossa/musem/internal/sqlite"
+	"github.com/MrSossa/musem/internal/tmux"
 	"github.com/MrSossa/musem/internal/tui"
 )
 
@@ -79,7 +82,10 @@ func run(fake bool, interval time.Duration) error {
 	// forgetting silently is not. Every restart would reset every session's
 	// cost to zero with nothing on screen or on stderr to explain why, and a
 	// read-only config directory would look exactly like a fresh install.
-	var store cost.HistoryStore
+	var (
+		store cost.HistoryStore
+		owned launch.Ownership
+	)
 	path, err := sqlite.DefaultPath()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "musem: history is disabled: %s\n", musem.ErrorMessage(err))
@@ -88,6 +94,11 @@ func run(fake bool, interval time.Duration) error {
 	} else {
 		defer func() { _ = s.Close() }()
 		store = s
+		// The same store holds the record of which worktrees musem created.
+		// Without it, launching into a worktree is refused rather than done and
+		// forgotten: the record is what permits the removal, and a worktree musem
+		// could never take back is one it should not make.
+		owned = s
 	}
 
 	accountant := cost.New(cost.NewRateTable(), usage, store)
@@ -96,13 +107,49 @@ func run(fake bool, interval time.Duration) error {
 		fmt.Fprintf(os.Stderr, "musem: could not restore history: %s\n", musem.ErrorMessage(err))
 	}
 
-	reg := registry.New(discoverer, branches, registry.WithInterval(interval))
-	composer := app.New(reg, accountant)
+	// Launching is composed here and nowhere else: git provides the worktrees,
+	// tmux the substrate, the Claude CLI the agent, and SQLite the record of what
+	// was created. The launcher knows none of those names.
+	launcher := launch.New(git.NewWorktrees(), tmux.NewSessions(), claude.NewAgent(), owned)
 
-	program := tea.NewProgram(tui.NewModel(), tea.WithAltScreen(), tea.WithContext(ctx))
+	// Reclamation hangs off the registry's own end-of-session transition, which
+	// is only ever reached by a discovery pass that could read everything it
+	// found. A session that merely appears to have gone never gets here, and its
+	// worktree is never a candidate for deletion.
+	ends := make(chan musem.Session, endBacklog)
+	reg := registry.New(discoverer, branches,
+		registry.WithInterval(interval),
+		registry.WithSessionEnded(func(s musem.Session) {
+			select {
+			case ends <- s:
+			default:
+				// The observer runs on the refresh loop and must not block it. A
+				// reclamation dropped here is not lost work: the worktree stays,
+				// which is the direction every decision in this path errs in.
+			}
+		}),
+	)
+	composer := app.New(reg, accountant, app.WithReclamations(launcher))
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		// The form can still be filled in by hand; it just starts empty.
+		cwd = ""
+	}
+
+	program := tea.NewProgram(
+		tui.NewModel(
+			tui.WithLauncher(launcher),
+			tui.WithWorkingDir(cwd),
+			tui.WithContext(ctx),
+		),
+		tea.WithAltScreen(),
+		tea.WithContext(ctx),
+	)
 
 	// One goroutine per source, each feeding the single pump.
 	go reg.Run(ctx)
+	go reclaim(ctx, launcher, ends)
 
 	quit := make(chan struct{})
 	pumped := make(chan struct{})
@@ -141,6 +188,28 @@ func run(fake bool, interval time.Duration) error {
 // shutdownGrace bounds how long musem waits for the refresh loop to notice it
 // has been cancelled.
 const shutdownGrace = 2 * time.Second
+
+// endBacklog is how many ended sessions may be waiting to have their worktrees
+// reclaimed. Reclamation shells out to git several times per session, and the
+// refresh loop that announces the ends must not queue behind it.
+const endBacklog = 64
+
+// reclaim takes back the worktrees of sessions that have ended, one at a time.
+//
+// Serial by construction: two removals at once would be two git processes
+// writing to the same repository's administrative files, and there is nothing
+// here worth the concurrency. The result reaches the interface through the
+// launcher, which the composer reads on every frame.
+func reclaim(ctx context.Context, launcher *launch.Launcher, ends <-chan musem.Session) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case s := <-ends:
+			launcher.Reclaim(ctx, s)
+		}
+	}
+}
 
 // shutdownError decides whether the UI loop stopping was a failure.
 //

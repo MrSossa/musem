@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/MrSossa/musem"
+	"github.com/MrSossa/musem/internal/safetext"
 )
 
 // These tests run against fixtures captured from real CLI output. Their job is
@@ -1034,10 +1035,10 @@ func TestTranscriptReplacedByAShorterOneIsDetected(t *testing.T) {
 // The CLI's message reaches the dashboard header, where half a character is
 // both unreadable and mis-measured by everything that lays the line out.
 func TestCLIDetailIsTruncatedOnARuneBoundary(t *testing.T) {
-	got := firstLine(strings.Repeat("→", 400))
+	got := safetext.FirstLine(strings.Repeat("→", 400), nil)
 
 	if !utf8.ValidString(got) {
-		t.Errorf("firstLine produced invalid UTF-8: %q", got)
+		t.Errorf("FirstLine produced invalid UTF-8: %q", got)
 	}
 	if !strings.HasSuffix(got, "…") {
 		t.Errorf("a truncated message must say so: %q", got)

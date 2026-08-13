@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
 	"time"
 
 	"github.com/MrSossa/musem"
@@ -85,7 +84,7 @@ func (d *Discoverer) Discover(ctx context.Context) (musem.Discovery, error) {
 		// unsupported flag after an upgrade, a config problem, a pending auth
 		// prompt. It was already captured; throwing it away leaves the user an
 		// error they cannot act on.
-		if detail := firstLine(res.Stderr); detail != "" {
+		if detail := safetext.FirstLine(res.Stderr, nil); detail != "" {
 			return musem.Discovery{}, musem.Wrap(err, musem.EUNAVAILABLE,
 				"the Claude CLI failed to list sessions: %s", detail)
 		}
@@ -94,35 +93,6 @@ func (d *Discoverer) Discover(ctx context.Context) (musem.Discovery, error) {
 	}
 
 	return parseAgents([]byte(res.Stdout))
-}
-
-// firstLine returns the first non-empty line of s, bounded so a CLI that writes
-// a stack trace to stderr cannot push the rest of the interface off the screen.
-//
-// The text is sanitised for the same reason session names and directories are:
-// it is written by another program and it reaches the terminal, where an escape
-// sequence is an instruction rather than a glyph. It is the likelier vector of
-// the two, not the rarer one — a CLI reporting a failure tends to quote the
-// input that caused it, and the inputs here are working directories that may
-// come from a repository nobody vetted. It is also drawn on every frame for as
-// long as discovery keeps failing.
-func firstLine(s string) string {
-	const maxDetail = 200
-
-	for _, line := range strings.Split(s, "\n") {
-		line = safetext.Clean(strings.TrimSpace(line))
-		if line == "" {
-			continue
-		}
-		// Cut on a rune boundary, not a byte one. This text reaches the
-		// dashboard header, where half a character is both unreadable and
-		// mis-measured by everything that lays the line out.
-		if runes := []rune(line); len(runes) > maxDetail {
-			line = string(runes[:maxDetail]) + "…"
-		}
-		return line
-	}
-	return ""
 }
 
 // parseAgents maps the CLI payload onto musem sessions. It is separate from the

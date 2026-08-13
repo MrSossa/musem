@@ -61,3 +61,43 @@ func HasUnprintable(s string) bool { return strings.ContainsFunc(s, unprintable)
 // containing U+202E, so a branch really can arrive carrying a direction
 // override that reorders the text drawn around it.
 func unprintable(r rune) bool { return !unicode.IsPrint(r) && r != ' ' }
+
+// maxDetail bounds a line of foreign text on its way to the interface.
+//
+// A CLI that writes a stack trace to stderr must not be able to push the rest of
+// the dashboard off the screen, and this text is drawn on every frame for as
+// long as the failure lasts.
+const maxDetail = 200
+
+// FirstLine returns the first line of s that says something, cleaned and
+// bounded.
+//
+// Three adapters need this: the Claude CLI, git and tmux all report a failure as
+// prose on stderr, and all three want the same thing out of it — the first line
+// that is not blank, made safe to draw and short enough not to take over the
+// screen. Each keeping its own copy is the failure mode this package's own
+// documentation warns about, one level up: not the character cleaning going
+// missing, but the bound, or the rune-boundary cut, drifting apart between them.
+//
+// skip drops lines the caller knows are noise before the useful one — git
+// announcing "Preparing worktree" before it explains what went wrong. Nil means
+// skip nothing.
+func FirstLine(s string, skip func(string) bool) string {
+	for _, line := range strings.Split(s, "\n") {
+		line = Clean(strings.TrimSpace(line))
+		if line == "" {
+			continue
+		}
+		if skip != nil && skip(line) {
+			continue
+		}
+		// Cut on a rune boundary, not a byte one. This text reaches a terminal,
+		// where half a character is both unreadable and mis-measured by
+		// everything that lays the line out.
+		if runes := []rune(line); len(runes) > maxDetail {
+			line = string(runes[:maxDetail]) + "…"
+		}
+		return line
+	}
+	return ""
+}

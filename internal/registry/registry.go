@@ -106,6 +106,10 @@ type Registry struct {
 	branchTTL time.Duration
 	now       func() time.Time
 
+	// onEnded are notified when a session is marked as ended. Set once at
+	// construction and never written afterwards, so they need no lock.
+	onEnded []func(musem.Session)
+
 	mu sync.RWMutex
 	// sessions is keyed by the session's own stable identifier. Titles and
 	// paths are user-editable and would collide or churn as keys.
@@ -160,6 +164,26 @@ func WithClock(now func() time.Time) Option {
 	return func(r *Registry) {
 		if now != nil {
 			r.now = now
+		}
+	}
+}
+
+// WithSessionEnded registers an observer called once for each session the
+// registry marks as having ended.
+//
+// It exists so that acting on the end of a session — reclaiming what was created
+// for it — hangs off the moment the registry decides one, rather than off a
+// sweep that would have to decide it again. The guard that matters comes with
+// it: a session is only ever called ended by a pass that could read everything
+// it found, so a session that merely appears to have gone, because a parser
+// broke, never reaches the observer at all.
+//
+// The observer is called outside the lock, once per session per end, and must
+// not block: it runs on the refresh loop.
+func WithSessionEnded(f func(musem.Session)) Option {
+	return func(r *Registry) {
+		if f != nil {
+			r.onEnded = append(r.onEnded, f)
 		}
 	}
 }
@@ -227,6 +251,21 @@ func (r *Registry) Refresh(ctx context.Context) {
 	// experience as a freeze, since it reads a snapshot every frame.
 	branches := r.resolveBranches(ctx, found)
 
+	// The observers are called after the lock is released. They act on the end of
+	// a session — reclaiming a worktree is the first of them — and that is work
+	// no reader of a snapshot should be waiting behind.
+	for _, s := range r.fold(discovery, branches) {
+		for _, notify := range r.onEnded {
+			notify(s)
+		}
+	}
+}
+
+// fold merges one discovery pass into what is known and returns the sessions it
+// marked as ended.
+func (r *Registry) fold(discovery musem.Discovery, branches map[string]string) []musem.Session {
+	found := discovery.Sessions
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -288,6 +327,7 @@ func (r *Registry) Refresh(ctx context.Context) {
 	// direction to err in: a finished session shown as live for one cycle is
 	// noise, a live session shown as finished is a session the user stops
 	// looking at.
+	var justEnded []musem.Session
 	if discovery.Skipped == 0 {
 		for id, s := range r.sessions {
 			if seen[id] || s.Ended() {
@@ -307,10 +347,12 @@ func (r *Registry) Refresh(ctx context.Context) {
 				s.StatusSince = now
 			}
 			r.sessions[id] = s
+			justEnded = append(justEnded, s)
 		}
 	}
 
 	r.updatedAt = now
+	return justEnded
 }
 
 // resolveBranches returns the branch for every distinct directory in sessions,

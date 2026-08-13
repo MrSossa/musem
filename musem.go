@@ -1,5 +1,6 @@
-// Package musem holds the domain types for musem, a read-only observatory for
-// AI coding agent sessions running on this machine.
+// Package musem holds the domain types for musem, an observatory for the AI
+// coding agent sessions running on this machine and the place they are started
+// from.
 //
 // This package imports nothing outside the standard library. Every other
 // package depends on it and it depends on none of them, which is what keeps the

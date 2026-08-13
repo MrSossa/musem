@@ -21,11 +21,12 @@ const modulePath = "github.com/MrSossa/musem"
 
 // adapters wrap something foreign: a CLI, a database, the filesystem. They are
 // named after what they wrap so that "does this belong here?" answers itself.
-var adapters = []string{"claude", "sqlite", "git", "inmem"}
+var adapters = []string{"claude", "sqlite", "git", "inmem", "tmux"}
 
 // orchestration packages own behaviour that belongs to no single adapter: the
-// discovery loop, staleness tracking, cost aggregation across sources.
-var orchestration = []string{"registry", "cost"}
+// discovery loop, staleness tracking, cost aggregation across sources, and the
+// sequence that creates a worktree, records it and starts a session in it.
+var orchestration = []string{"registry", "cost", "launch"}
 
 // helpers wrap a piece of the standard library that is easy to get wrong, and
 // nothing else. They know no musem type and no musem package.
