@@ -23,6 +23,7 @@ import (
 
 	"github.com/MrSossa/musem"
 	"github.com/MrSossa/musem/internal/app"
+	"github.com/MrSossa/musem/internal/safetext"
 )
 
 // SnapshotMsg carries a new snapshot into the update loop.
@@ -920,9 +921,17 @@ func (m Model) renderLaunched(width int) string {
 		// Where it is, on what, and under what name. The branch is absent for a
 		// launch that made no worktree, and saying "—" there would invent a
 		// distinction the user did not ask about.
-		where := l.Dir
+		//
+		// The path and the branch are cleaned on the way to the screen, as the
+		// same two values are in the form that produced them: the path is
+		// whatever git printed for a directory somebody else named, and the
+		// branch is a name whoever made the branch chose. The session's own name
+		// is not, because musem generated it. Drawn here for as long as the
+		// session takes to appear, which is the case that makes an escape
+		// sequence worth caring about.
+		where := safetext.Clean(l.Dir)
 		if l.Branch != "" {
-			where = l.Branch + " in " + l.Dir
+			where = safetext.Clean(l.Branch) + " in " + where
 		}
 		b.WriteString(styleWaiting.Render(padWide(clip(
 			"  ⟳ started "+l.Substrate+" — "+where, width), width)))

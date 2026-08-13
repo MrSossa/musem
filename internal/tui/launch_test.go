@@ -767,3 +767,28 @@ func TestTheLaunchReportStaysInsideANarrowTerminal(t *testing.T) {
 		}
 	}
 }
+
+// A path or a branch is foreign text on its way to a terminal, where an escape
+// sequence is an instruction rather than a glyph — and this line is drawn on
+// every frame for as long as the session takes to appear.
+func TestTheLaunchReportCannotDriveTheTerminal(t *testing.T) {
+	m := NewModel(WithLauncher(newFakeLauncher()))
+	m.width, m.height = 100, 24
+	m.launched = []musem.LaunchOutcome{
+		launchedInto("abc123", "feat/‮niam", "/r/api\x1b[2J-musem"),
+	}
+	m = withSnapshot(m, snapshot(row("other", "other", musem.StatusIdle)))
+
+	view := stripANSI(m.View())
+	if strings.ContainsRune(view, '‮') {
+		t.Error("the report still carries a direction override")
+	}
+	if strings.Contains(view, "\x1b[2J") {
+		t.Error("the report still carries an escape sequence")
+	}
+	// Cleaned, not refused: the readable part of an odd name is worth more than
+	// a blank line where a session should be.
+	if !strings.Contains(view, "musem-abc123") {
+		t.Errorf("the report lost the session it was announcing:\n%s", view)
+	}
+}
