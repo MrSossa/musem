@@ -720,3 +720,67 @@ func TestEndedSessionsSortBelowLiveOnes(t *testing.T) {
 		t.Error("the ended session belongs at the bottom")
 	}
 }
+
+// The end of a session is announced once, to whoever asked to hear about it.
+// Reclaiming a worktree hangs off this moment rather than off a sweep of its
+// own, so the announcement has to be exactly as reliable as the decision behind
+// it.
+func TestTheEndOfASessionIsAnnouncedOnce(t *testing.T) {
+	d := &fakeDiscoverer{sessions: []musem.Session{session("a", "alpha", "/p/alpha", musem.StatusIdle)}}
+
+	var ends []musem.Session
+	r := New(d, fakeBranches{}, WithSessionEnded(func(s musem.Session) {
+		ends = append(ends, s)
+	}))
+
+	r.Refresh(context.Background())
+	if len(ends) != 0 {
+		t.Fatalf("a live session was announced as ended: %+v", ends)
+	}
+
+	d.sessions = nil
+	r.Refresh(context.Background())
+	if len(ends) != 1 {
+		t.Fatalf("ends = %d, want the one session that went away", len(ends))
+	}
+	if ends[0].ID != "a" || !ends[0].Ended() {
+		t.Errorf("announced %+v, want session a marked as ended", ends[0])
+	}
+
+	// Further passes must not announce it again: acting on an end twice is
+	// acting on a worktree that has already been dealt with.
+	r.Refresh(context.Background())
+	r.Refresh(context.Background())
+	if len(ends) != 1 {
+		t.Errorf("ends = %d after two more passes, want the end announced once", len(ends))
+	}
+}
+
+// R9, R10: a session that only appears to have ended, because the pass could not
+// read every record it found, must never become a reclamation candidate. This is
+// the guard that keeps a change in a foreign format from deleting the work of
+// every session running on the machine.
+func TestADegradedPassNeverAnnouncesAnEnd(t *testing.T) {
+	d := &fakeDiscoverer{sessions: []musem.Session{session("a", "alpha", "/p/alpha", musem.StatusRunning)}}
+
+	var ends []musem.Session
+	r := New(d, fakeBranches{}, WithSessionEnded(func(s musem.Session) {
+		ends = append(ends, s)
+	}))
+	r.Refresh(context.Background())
+
+	// The session vanishes from a pass that admits it could not read everything.
+	d.sessions, d.skipped = nil, 3
+	r.Refresh(context.Background())
+
+	if len(ends) != 0 {
+		t.Fatalf("a degraded pass announced %+v as ended; its worktree would have been considered for deletion", ends)
+	}
+
+	// A clean pass that still does not find it is what settles the question.
+	d.skipped = 0
+	r.Refresh(context.Background())
+	if len(ends) != 1 {
+		t.Errorf("ends = %d, want the end announced once a pass could vouch for it", len(ends))
+	}
+}

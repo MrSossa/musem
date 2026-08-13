@@ -53,8 +53,23 @@ func TestEmptyStateExplains(t *testing.T) {
 	if !strings.Contains(view, "No agent sessions are running") {
 		t.Error("an empty dashboard must explain itself, not show a blank table")
 	}
-	if !strings.Contains(view, "does not start them") {
-		t.Error("the empty state should say what musem does and does not do")
+	if !strings.Contains(view, "whoever started it") {
+		t.Error("the empty state should say what musem watches")
+	}
+}
+
+// The empty state offers the launch key only where there is something behind
+// it. A key that does nothing reads as a broken feature rather than an absent
+// one, and the user goes looking for the fault in their keyboard.
+func TestTheEmptyStateOffersLaunchingOnlyWhenItCan(t *testing.T) {
+	plain := withSnapshot(NewModel(), snapshot()).View()
+	if strings.Contains(plain, "Press n") {
+		t.Error("a musem that cannot launch tells the user to press n")
+	}
+
+	launchable := withSnapshot(NewModel(WithLauncher(newFakeLauncher())), snapshot()).View()
+	if !strings.Contains(launchable, "Press n") {
+		t.Error("a musem that can launch does not say so on an empty dashboard")
 	}
 }
 
@@ -295,10 +310,17 @@ func TestLiveResize(t *testing.T) {
 	}
 }
 
-// The dashboard observes and nothing else. This scans the package for calls
-// that could change a session or the filesystem — a rule that is otherwise only
-// a promise in the design document.
-func TestDashboardHasNoMutatingOperations(t *testing.T) {
+// R11: the view cannot touch anything directly. This scans the package for the
+// calls that would let it — running a process, writing to the filesystem,
+// signalling anything.
+//
+// It replaces the read-only rule this dashboard used to be held to. That rule is
+// gone: musem launches sessions now, and launching creates a worktree. What
+// survives it, and is worth more, is the boundary underneath: the view describes
+// what should happen and hands it to a launcher, and the launcher is the only
+// thing that can act. A form is not a launch, and a package that cannot open a
+// file cannot grow a write path by accident.
+func TestTheViewCannotTouchAnythingDirectly(t *testing.T) {
 	forbidden := map[string]string{
 		"exec":  "running a process",
 		"os":    "touching the filesystem",
@@ -335,10 +357,10 @@ func TestDashboardHasNoMutatingOperations(t *testing.T) {
 		for _, imp := range file.Imports {
 			path := strings.Trim(imp.Path.Value, `"`)
 			if reason, bad := forbidden[path]; bad {
-				t.Errorf("%s imports %q (%s); the dashboard is read-only", name, path, reason)
+				t.Errorf("%s imports %q (%s); the view acts through a launcher or not at all", name, path, reason)
 			}
 			if strings.HasPrefix(path, "os/exec") || path == "os" {
-				t.Errorf("%s imports %q; the dashboard is read-only", name, path)
+				t.Errorf("%s imports %q; the view acts through a launcher or not at all", name, path)
 			}
 		}
 		ast.Inspect(file, func(n ast.Node) bool {
@@ -348,7 +370,7 @@ func TestDashboardHasNoMutatingOperations(t *testing.T) {
 			}
 			switch sel.Sel.Name {
 			case "Remove", "RemoveAll", "WriteFile", "Create", "Kill":
-				t.Errorf("%s calls %s; the dashboard must not alter anything", name, sel.Sel.Name)
+				t.Errorf("%s calls %s; the view must not alter anything itself", name, sel.Sel.Name)
 			}
 			return true
 		})
@@ -721,9 +743,10 @@ func TestRenderedFragmentsDoNotHideALine(t *testing.T) {
 	m = next.(Model)
 
 	for name, fragment := range map[string]string{
-		"footer": footerText(),
-		"empty":  m.renderEmpty(),
-		"help":   renderHelp(80),
+		"footer":             footerText(80, false),
+		"footer with launch": footerText(80, true),
+		"empty":              m.renderEmpty(),
+		"help":               renderHelp(80),
 	} {
 		drawn := len(strings.Split(strings.TrimSuffix(fragment, "\n"), "\n"))
 		if counted := lineCount(fragment); counted != drawn {

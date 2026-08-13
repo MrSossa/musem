@@ -547,3 +547,49 @@ func TestUnreadRecordsReachTheView(t *testing.T) {
 		t.Errorf("the view does not report the records that were dropped:\n%s", view)
 	}
 }
+
+// fakeReclamations is a source of worktrees kept when their session ended.
+type fakeReclamations struct{ notices []musem.Reclamation }
+
+func (f fakeReclamations) Notices() []musem.Reclamation { return f.notices }
+
+// R9: the reason a worktree was kept has to reach the view, and the view reads
+// composed snapshots. Joining it here rather than in the UI is what keeps a
+// second front end from having to repeat the join.
+func TestKeptWorktreesReachTheSnapshot(t *testing.T) {
+	d := inmem.NewDiscoverer()
+	d.SetSessions(live("a"))
+	reg := registry.New(d, inmem.BranchResolver{})
+	reg.Refresh(context.Background())
+
+	kept := []musem.Reclamation{
+		{SessionID: "a", Path: "/r/api-musem-session-1", Reason: "it has uncommitted changes"},
+	}
+	composer := app.New(reg, cost.New(cost.NewRateTable(), inmem.NewUsageReader(), nil),
+		app.WithReclamations(fakeReclamations{notices: kept}))
+
+	snap := composer.Snapshot()
+	if len(snap.Kept) != 1 {
+		t.Fatalf("Kept = %+v, want the one worktree that survived", snap.Kept)
+	}
+	if snap.Kept[0].Reason != "it has uncommitted changes" {
+		t.Errorf("reason = %q, want it carried through", snap.Kept[0].Reason)
+	}
+}
+
+// A musem that cannot launch has no reclamations, and the snapshot is the same
+// otherwise rather than being unbuildable.
+func TestASnapshotWithoutAReclamationSourceIsFine(t *testing.T) {
+	d := inmem.NewDiscoverer()
+	d.SetSessions(live("a"))
+	reg := registry.New(d, inmem.BranchResolver{})
+	reg.Refresh(context.Background())
+
+	snap := app.New(reg, cost.New(cost.NewRateTable(), inmem.NewUsageReader(), nil)).Snapshot()
+	if len(snap.Kept) != 0 {
+		t.Errorf("Kept = %+v, want none", snap.Kept)
+	}
+	if len(snap.Rows) != 1 {
+		t.Errorf("rows = %d, want the session still there", len(snap.Rows))
+	}
+}

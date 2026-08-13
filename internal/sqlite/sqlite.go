@@ -168,6 +168,32 @@ var migrations = []string{
 	// is nothing left to recover: the session resumes from zero and climbs
 	// again as new usage arrives.
 	`UPDATE session_costs SET priced_usd = cost_usd WHERE cost_known = 1`,
+
+	// The worktrees musem created, and therefore the only ones it may ever
+	// remove.
+	//
+	// It is a record of what musem did, so it has to outlive the process that
+	// did it: a table rather than a map, because every restart would otherwise
+	// be a licence to forget, and forgetting here means either abandoning
+	// musem's own worktrees or — with ownership inferred from a path instead —
+	// adopting somebody else's.
+	//
+	// An older store migrates forward into an empty table, which says musem owns
+	// nothing and therefore removes nothing. That is the right answer for a
+	// database written before this existed: musem had created no worktrees then,
+	// and a record it never wrote must not become permission it never earned.
+	`CREATE TABLE IF NOT EXISTS session_worktrees (
+		session_id TEXT PRIMARY KEY,
+		path       TEXT NOT NULL,
+		repo       TEXT NOT NULL,
+		branch     TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL DEFAULT ''
+	)`,
+
+	// One record per worktree, enforced rather than assumed. Two rows claiming
+	// the same path would be two sessions each believing they may delete it, and
+	// the second removal would be of a directory the first had already replaced.
+	`CREATE UNIQUE INDEX IF NOT EXISTS session_worktrees_path ON session_worktrees(path)`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {

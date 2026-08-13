@@ -3,6 +3,8 @@ package claude
 import (
 	"strings"
 	"testing"
+
+	"github.com/MrSossa/musem/internal/safetext"
 )
 
 // The dashboard redraws every refresh, so a name carrying an escape sequence is
@@ -46,7 +48,7 @@ func TestForeignTextCannotCarryTerminalInstructions(t *testing.T) {
 // repository nobody vetted. It reaches the same terminal, on every frame, for as
 // long as discovery keeps failing.
 func TestTheCLIExplanationCannotCarryTerminalInstructions(t *testing.T) {
-	detail := firstLine("error: cannot open \x1b]0;owned\x07/p/\x1b[2Japi\n")
+	detail := safetext.FirstLine("error: cannot open \x1b]0;owned\x07/p/\x1b[2Japi\n", nil)
 
 	if strings.ContainsRune(detail, 0x1b) || strings.ContainsRune(detail, 0x07) {
 		t.Errorf("detail = %q still carries a control character", detail)
@@ -62,7 +64,7 @@ func TestTheCLIExplanationCannotCarryTerminalInstructions(t *testing.T) {
 // stops being an instruction, and whatever remains is inert text rather than a
 // redaction.
 func TestADisarmedSequenceIsLeftAsInertText(t *testing.T) {
-	detail := firstLine("\x1b[2Jerror: the real reason")
+	detail := safetext.FirstLine("\x1b[2Jerror: the real reason", nil)
 
 	if strings.ContainsRune(detail, 0x1b) {
 		t.Errorf("detail = %q still carries the escape that made it a sequence", detail)
@@ -76,7 +78,7 @@ func TestADisarmedSequenceIsLeftAsInertText(t *testing.T) {
 // an empty line is not an explanation. Falling through to the next one keeps a
 // real message from being lost behind a crafted blank.
 func TestAnExplanationOfPureControlBytesIsSkipped(t *testing.T) {
-	if got := firstLine("\x1b\x07\x00\nerror: the real reason\n"); got != "error: the real reason" {
+	if got := safetext.FirstLine("\x1b\x07\x00\nerror: the real reason\n", nil); got != "error: the real reason" {
 		t.Errorf("firstLine = %q, want the first line that says something", got)
 	}
 }

@@ -4,9 +4,15 @@
 // and decides nothing about what is true — the core decides what is true, the
 // UI decides how it looks. The test for anything that lands here: if a CLI
 // front end would have to copy it, it does not belong in this package.
+//
+// The launch form is the one place something can be caused to happen, and it
+// causes it by describing a request and handing it to a launcher. This package
+// cannot open a file or run a process — a test parses its sources and fails on
+// either — so the write path it fronts is one it can only ask for.
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -31,6 +37,25 @@ type Model struct {
 	showHelp bool
 	detail   bool
 
+	// form is the launch form while it is open, nil otherwise. It is the only
+	// pointer in this struct, and it is one so that "no form" is a state rather
+	// than a flag beside a value nobody should read.
+	form *form
+
+	// launcher is what the form calls. Nil disables launching entirely, which is
+	// what a musem with no substrate or no history store runs as: observing
+	// still works, and the key that would open the form does nothing.
+	launcher Launcher
+
+	// cwd is the directory the form starts from. It is passed in rather than
+	// read here: this package cannot touch the filesystem, which is asserted by
+	// a test.
+	cwd string
+
+	// ctx bounds the work the form starts, so a musem being shut down does not
+	// leave a validation running.
+	ctx context.Context
+
 	// clock is read for the one age the view computes itself: how long a
 	// session has held its status. Every other age arrives already measured, by
 	// the registry that owns the timestamps behind it. Replaceable so a test can
@@ -38,8 +63,32 @@ type Model struct {
 	clock func() time.Time
 }
 
+// Option configures a Model.
+type Option func(*Model)
+
+// WithLauncher enables launching from the dashboard.
+func WithLauncher(l Launcher) Option {
+	return func(m *Model) { m.launcher = l }
+}
+
+// WithWorkingDir sets the directory the launch form starts from.
+func WithWorkingDir(dir string) Option {
+	return func(m *Model) { m.cwd = dir }
+}
+
+// WithContext bounds the work the form starts.
+func WithContext(ctx context.Context) Option {
+	return func(m *Model) { m.ctx = ctx }
+}
+
 // NewModel returns an empty dashboard.
-func NewModel() Model { return Model{} }
+func NewModel(opts ...Option) Model {
+	var m Model
+	for _, opt := range opts {
+		opt(&m)
+	}
+	return m
+}
 
 // now reads the model's clock, falling back to the real one. The fallback is
 // what lets Model stay usable as its zero value, which is how NewModel and every
@@ -72,7 +121,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.form != nil {
+			next, cmd := m.handleFormKey(msg)
+			return next, cmd
+		}
 		return m.handleKey(msg)
+	}
+
+	// Everything the form starts comes back here, and only here. The launch runs
+	// in its own goroutine; nothing it touches is reachable from outside Update.
+	if next, cmd, handled := m.updateForm(msg); handled {
+		return next, cmd
 	}
 	return m, nil
 }
@@ -109,6 +168,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.snapshot.Rows) > 0 {
 			m.detail = !m.detail
 		}
+	case "n":
+		// The one key in this package that can cause anything to be created, and
+		// it causes a form rather than a launch: nothing happens until the form
+		// is confirmed.
+		return m.openForm()
 	}
 	return m, nil
 }
@@ -324,7 +388,7 @@ func (m Model) View() string {
 	}
 
 	header := m.renderHeader(width)
-	footer := footerText()
+	footer := footerText(width, m.launcher != nil)
 
 	var b strings.Builder
 	b.WriteString(header)
@@ -337,6 +401,11 @@ func (m Model) View() string {
 	body := max(1, m.height-lineCount(header)-lineCount(footer)-1)
 
 	switch {
+	case m.form != nil:
+		// The form outranks every other pane. It is the one place in this
+		// interface where something can be caused to happen, and a snapshot
+		// arriving mid-edit must not be able to take it off the screen.
+		b.WriteString(clipLines(m.renderForm(), body, m.height))
 	case m.showHelp:
 		b.WriteString(clipLines(renderHelp(width), body, m.height))
 	case len(m.snapshot.Rows) == 0:
@@ -379,7 +448,16 @@ func (m Model) View() string {
 // padded blank line and drops the newline itself — so the fragment would occupy
 // one more terminal row than lineCount reports, and every budget built on that
 // count would be wrong by one.
-func footerText() string { return "\n" + styleDim.Render("  ?  help   q  quit") + "\n" }
+func footerText(width int, launchable bool) string {
+	keys := "  ?  help   q  quit"
+	if launchable {
+		keys = "  n  launch   ?  help   q  quit"
+	}
+	// Clipped like every other line here. The hint grew when launching was added
+	// to it, and a footer that wraps costs a terminal row View budgeted by
+	// counting newlines — which the header then pays for.
+	return "\n" + styleDim.Render(clip(keys, width)) + "\n"
+}
 
 // lineCount reports how many terminal lines s occupies. Every fragment here
 // ends in a newline, so counting newlines counts lines.
@@ -472,16 +550,60 @@ func (m Model) renderHeader(width int) string {
 			"  ! %d session records could not be read; sessions may be missing or stale", n), width)))
 		b.WriteString("\n")
 	}
+	b.WriteString(m.renderKept(width))
+
 	b.WriteString("\n")
 	return b.String()
 }
 
+// maxKeptNotices is how many kept worktrees the header names before it starts
+// counting them instead. Each one costs a terminal row that the table then does
+// not get, and past a couple of them the list has stopped being a notice.
+const maxKeptNotices = 2
+
+// renderKept says which worktrees musem created and did not take back.
+//
+// It is in the header rather than beside a row because the sessions these
+// belong to have ended, and an ended session scrolls to the bottom of a list the
+// user is not looking at. The worktree is still on disk and still holding their
+// work; the reason is the whole of what makes that actionable.
+func (m Model) renderKept(width int) string {
+	kept := m.snapshot.Kept
+	if len(kept) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	for i, r := range kept {
+		if i >= maxKeptNotices {
+			b.WriteString(styleStale.Render(padWide(clip(fmt.Sprintf(
+				"  ⚠ and %d more worktrees were kept", len(kept)-maxKeptNotices), width), width)))
+			b.WriteString("\n")
+			break
+		}
+		b.WriteString(styleStale.Render(padWide(clip(
+			"  ⚠ kept "+r.Path+" — "+r.Reason, width), width)))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// renderEmpty explains an empty dashboard, and says what to do about it.
+//
+// What to do depends on whether this musem can launch. Offering a key that does
+// nothing is worse than offering none: it reads as a broken feature rather than
+// an absent one, and the user goes looking for the fault in their keyboard.
 func (m Model) renderEmpty() string {
 	width := m.viewWidth()
+
+	second := "  Start one and it will appear here on the next refresh."
+	if m.launcher != nil {
+		second = "  Press n to launch one, or start one elsewhere and it will appear here."
+	}
 	return styleDim.Render(
 		clip("  No agent sessions are running.", width)+"\n\n"+
-			clip("  musem observes sessions started elsewhere; it does not start them.", width)+"\n"+
-			clip("  Open one and it will appear here on the next refresh.", width)) + "\n"
+			clip(second, width)+"\n"+
+			clip("  musem watches every session on this machine, whoever started it.", width)) + "\n"
 }
 
 // renderTable draws at most maxRows lines of sessions, scrolled so the cursor
@@ -675,12 +797,13 @@ func (m Model) viewWidth() int {
 	return m.width
 }
 
-func renderHelp(width int) string {
+func renderHelp(width int) string { //nolint:revive // one list, read top to bottom
 	rows := [][2]string{
 		{"j / ↓", "next session"},
 		{"k / ↑", "previous session"},
 		{"g / G", "first / last"},
 		{"enter", "session detail"},
+		{"n", "launch a session"},
 		{"?", "toggle this help"},
 		{"q / esc", "close, or quit"},
 		{"ctrl-c", "quit"},

@@ -71,12 +71,34 @@ type Snapshot struct {
 	// exactly this many sessions — each of which is missing from the rows rather
 	// than shown wrongly in them.
 	Undiscovered int
+
+	// Kept names the worktrees musem created and did not take back when their
+	// session ended, with why.
+	//
+	// It is carried into the snapshot rather than left as something the user
+	// discovers on disk: a worktree that survived is still occupying space and
+	// still holding work somebody has to decide about, and the reason is the
+	// whole of what makes that decision possible. Removals are absent by
+	// design — the worktree is gone and there is nothing left to act on.
+	Kept []musem.Reclamation
+}
+
+// Reclamations reports the worktrees kept when their session ended.
+//
+// Declared here, by the consumer, so the composer can join them onto a snapshot
+// without knowing that launching is what produces them.
+type Reclamations interface {
+	Notices() []musem.Reclamation
 }
 
 // Composer assembles snapshots.
 type Composer struct {
 	registry   *registry.Registry
 	accountant *cost.Accountant
+
+	// reclamations may be nil: a musem that cannot launch has none, and the
+	// dashboard is the same otherwise.
+	reclamations Reclamations
 
 	// settled names ended sessions whose final usage has already been folded
 	// in. The registry never drops a session, so without this the refresh loop
@@ -117,6 +139,12 @@ func WithClock(now func() time.Time) Option {
 			c.now = now
 		}
 	}
+}
+
+// WithReclamations attaches the source of worktrees kept when their session
+// ended, so the dashboard can say which and why.
+func WithReclamations(src Reclamations) Option {
+	return func(c *Composer) { c.reclamations = src }
 }
 
 // New returns a Composer over the given sources.
@@ -163,7 +191,7 @@ func (c *Composer) Snapshot() Snapshot {
 	// holds more than that — history outlives the sessions that made it — and a
 	// figure summed over all of it under a count of the few on screen would
 	// belong to neither.
-	return Snapshot{
+	snap := Snapshot{
 		Rows:         rows,
 		Fleet:        c.accountant.Total(ids),
 		Stale:        inventory.Stale,
@@ -172,6 +200,10 @@ func (c *Composer) Snapshot() Snapshot {
 		ErrMessage:   inventory.ErrMessage,
 		Undiscovered: inventory.Skipped,
 	}
+	if c.reclamations != nil {
+		snap.Kept = c.reclamations.Notices()
+	}
+	return snap
 }
 
 // Refresh updates costs for every session still worth reading. Discovery has

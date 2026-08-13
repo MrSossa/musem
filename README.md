@@ -1,12 +1,14 @@
 # musem
 
-A read-only observatory for the AI coding agent sessions running on your
-machine. One screen answers "what is happening right now?" — which session is
-working, which one has been waiting on you for ten minutes, which one died, and
-what the whole thing is costing.
+An observatory for the AI coding agent sessions running on your machine, and the
+place you start them from. One screen answers "what is happening right now?" —
+which session is working, which one has been waiting on you for ten minutes,
+which one died, and what the whole thing is costing.
 
-musem **observes**. It does not start sessions, stop them, send them input, or
-touch your repositories.
+musem **observes**, and **launches**. It creates the worktrees it starts sessions
+in, and takes them back when the session ends and there is nothing in them left
+to lose. Everything else — sessions musem did not start, your repositories, the
+worktrees you made yourself — it never touches.
 
 ```
   musem   3 sessions   $328.59 total
@@ -31,9 +33,59 @@ Flags:
 | `--interval` | How long to wait between refreshes (default 2s) |
 
 Keys: `j`/`k` move, `g`/`G` jump to first/last, `enter` opens session detail,
-`?` shows help, `q` quits.
+`n` launches a session, `?` shows help, `q` quits.
 
 Requires macOS or Linux. Native Windows is deliberately out of scope.
+Launching additionally requires **tmux**, which hosts the session; without it
+musem still observes everything on the machine and says what is missing when you
+try to launch.
+
+## Launching a session
+
+Press `n`. A form opens with:
+
+| Field | What it does |
+| --- | --- |
+| **Directory** | Where the session works. Filled in with the directory musem was started from, and editable. |
+| **Worktree** | On by default. `space` toggles it. With it off the session starts in the directory as given and nothing is created. |
+| **Branch** | With a worktree, a new branch is proposed. Edit the name, or press `ctrl-b` to pick one that already exists. |
+| **Creates** | The path the worktree will occupy, derived from the repository and the branch, shown before anything is created. |
+
+`tab` moves between fields, `enter` launches, `esc` cancels. Nothing at all
+happens until you confirm: a form you abandon leaves no branch, no worktree and
+no session behind.
+
+The default is a worktree per session because two agents in one checkout fight
+over the index and over each other's edits. That discipline is the whole reason
+launching is worth automating, and it is the part people skip when it costs six
+steps.
+
+The session runs in tmux, detached, so it outlives musem: close the dashboard and
+the agent keeps working. `tmux ls` lists them — everything musem started is
+prefixed `musem-` — and `tmux attach -t <name>` gets you a terminal in it.
+
+A launch that cannot proceed says so in the form rather than half-happening — the
+directory is not a repository, the branch is already checked out somewhere else,
+the destination is taken, tmux or the Claude CLI is missing. A launch that fails
+after creating something undoes it, and if the undo itself fails it tells you
+what is left on disk and where.
+
+### When a session ends
+
+musem takes back the worktree it created for that session, and only if the
+worktree is clean. Clean means all four of:
+
+- nothing uncommitted,
+- nothing untracked,
+- no commits the branch's remote has not seen — including the case where the
+  branch has no remote at all, since then its commits exist in exactly one place,
+- nothing stashed.
+
+Anything else, or any of those four that git cannot answer, and the worktree
+stays. The dashboard says which worktree survived and why. musem never removes a
+worktree it did not create, however clean it is, and it never removes one you
+have work in — the record of what it created is the precondition, and git's own
+refusal to delete a dirty worktree is the second lock behind it.
 
 ## What it observes
 
@@ -69,6 +121,13 @@ survives both a restart and the transcripts being rotated away. How far each
 transcript has been read is stored in the same row as the total it produced, so
 a restart resumes where it left off rather than counting the same tokens again.
 
+The same database records which worktrees musem created. That record is what
+permits musem to remove one, so it has to outlive the process that made it —
+ownership is never inferred from what a path looks like, because renaming a
+directory would then either lose musem's own worktree or hand it somebody
+else's. With no database, launching into a worktree is refused rather than done
+and forgotten.
+
 ## Development
 
 ```sh
@@ -89,6 +148,11 @@ the root package depends on nothing outside the standard library, dependencies
 point inward, adapters wrap exactly one foreign thing each, the UI fetches
 nothing, and nothing reaches the network. Directory names do not enforce
 boundaries; the direction of the imports does.
+
+The UI is held to one rule beyond those: it cannot import `os` or `os/exec`, so
+it cannot touch the disk itself. The launch form describes what should happen and
+hands it to a launcher; that indirection is why a view with a write path behind
+it cannot grow a second one by accident.
 
 Planning artifacts live in `.ktools/`: open changes under `.ktools/changes/`,
 living specs under `.ktools/specs/`.
