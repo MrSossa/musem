@@ -106,13 +106,25 @@ SHALL NOT be written into.
 
 A confirmed launch SHALL create the worktree when enabled, start the agent
 session in the resulting directory, and the session SHALL then be discoverable by
-the same inventory that observes every other session.
+the same inventory that observes every other session, under the identifier the
+launch started it with.
+
+Discovery observes a session once the agent is running. An agent that asks the
+user to confirm access before it starts is hosted and waiting, not lost: it holds
+its place until the question is answered and is then observed like any other.
 
 ### Scenario: The session joins the inventory
 
-- **GIVEN** a confirmed launch
+- **GIVEN** a confirmed launch whose agent started unattended
 - **WHEN** the next discovery cycle runs
 - **THEN** the new session appears with its working directory and its branch
+
+### Scenario: The agent asks before it starts
+
+- **GIVEN** a launch whose agent asks the user to confirm access to the directory
+- **WHEN** nobody has answered it yet
+- **THEN** the session is hosted and waiting rather than lost, and is observed
+  under the identifier the launch chose once the question is answered
 
 ### Scenario: The session survives musem
 

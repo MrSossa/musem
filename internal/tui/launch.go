@@ -258,13 +258,28 @@ func (m Model) updateForm(msg tea.Msg) (Model, tea.Cmd, bool) {
 			return m, nil, true
 		}
 		if msg.Err != nil {
+			// Nothing is announced as started, because nothing was. The form
+			// stays open holding the reason, which is where the user can act on
+			// it.
 			f := *m.form
 			f.launching, f.failed = false, musem.ErrorMessage(msg.Err)
 			m.form = &f
 			return m, nil, true
 		}
-		// R5: the session joins the inventory on the next discovery pass, so the
-		// form's work is done and the dashboard is where the result shows up.
+
+		// The form's work is done, but the dashboard has nothing to show yet:
+		// discovery runs on its own interval, and an agent that asks to be let
+		// into a directory before it starts will wait in its pane until somebody
+		// answers. Closing on silence is what made a successful launch look like
+		// a keypress that did nothing.
+		//
+		// Appended to a fresh slice rather than in place: the model arrives here
+		// by value, and appending under a shared backing array would write into
+		// the copy bubbletea is holding.
+		next := make([]musem.LaunchOutcome, len(m.launched), len(m.launched)+1)
+		copy(next, m.launched)
+		m.launched = append(next, msg.Outcome)
+
 		return m.closeForm(), nil, true
 	}
 	return m, nil, false
